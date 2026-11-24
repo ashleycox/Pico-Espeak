@@ -111,6 +111,11 @@ int main()
         assert(speak("<speak>First <mark name=\"point\"/> second.</speak>",
                      espeakCHARS_UTF8 | espeakSSML) == ENS_OK);
         assert(marks == 1 && finished);
+        assert(espeak_ng_SetVoiceByName("en-us+klatt") == ENS_OK);
+        assert(speak("<?xml version=\"1.0\"?><speak><!-- This comment should be skipped. -->"
+                     "The balance is &quot;€12,345.67&quot; and the serial number is 189023543.</speak>",
+                     espeakCHARS_UTF8 | espeakSSML | espeakENDPAUSE) == ENS_OK);
+        assert(finished && heardSignal);
         interruptSpeech = true;
         assert(speak("Stop this sentence while it is still being spoken.") == ENS_SPEECH_STOPPED);
         assert(!finished);

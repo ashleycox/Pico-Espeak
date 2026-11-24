@@ -819,6 +819,21 @@ index 236a7b8f..6356e688 100644
  ESPEAK_NG_API int espeak_ng_GetSampleRate(void)
  {
  	return samplerate;
+diff --git a/src/libespeak-ng/ssml.c b/src/libespeak-ng/ssml.c
+index 233ddc69..485e451c 100644
+--- a/src/libespeak-ng/ssml.c
++++ b/src/libespeak-ng/ssml.c
+@@ -599,9 +599,8 @@ int ProcessSsmlTag(wchar_t *xml_buf, char *outbuf, int *outix, int n_outbuf, cha
+ 	SSML_STACK *ssml_sp;
+ 
+ 	// don't process comments and xml declarations
+-	if (wcsncmp(xml_buf, (wchar_t *) "!--", 3) == 0 || wcsncmp(xml_buf, (wchar_t *) "?xml", 4) == 0) {
++	if (wcsncmp(xml_buf, L"!--", 3) == 0 || wcsncmp(xml_buf, L"?xml", 4) == 0)
+ 		return 0;
+-		}
+ 
+ 	// these tags have no effect if they are self-closing, eg. <voice />
+ 	static const char ignore_if_self_closing[] = { 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1, 0, 0, 0, 0 };
 diff --git a/src/libespeak-ng/synthdata.c b/src/libespeak-ng/synthdata.c
 index b2b09436..700d42c2 100644
 --- a/src/libespeak-ng/synthdata.c
