@@ -16,6 +16,8 @@
 
 namespace espeak {
 
+using AudioStopCheck = bool (*)(void *userData);
+
 class AudioSink {
 public:
     virtual ~AudioSink() = default;
@@ -26,9 +28,18 @@ public:
     // number of samples accepted. A short write indicates an output error.
     virtual size_t writeSamples(const int16_t *samples, size_t count) = 0;
     virtual void flush() {}
+    // On interruption, leave pending audio for discard().
+    virtual void flushUntil(AudioStopCheck stop, void *userData)
+    {
+        if (stop == nullptr || !stop(userData)) {
+            flush();
+        }
+    }
     // Drop pending audio and leave the sink ready for the next utterance.
     virtual bool discard() { return true; }
     virtual bool ready() const = 0;
+    // Optional diagnostic with storage that remains valid across a restart.
+    virtual const char *lastErrorText() const { return nullptr; }
 };
 
 class NullAudioSink : public AudioSink {
@@ -49,6 +60,23 @@ bool playTestTone(AudioSink &sink,
                   int amplitude = 12000);
 
 #if ESPEAK_ARDUINO_HAS_AUDIOOUTPUTBASE
+enum class AudioError {
+    None,
+    NotReady,
+    InvalidSampleRate,
+    InvalidBuffering,
+    InsufficientMemory,
+    InvalidPins,
+    InvalidFormat,
+    DmaChannelsUnavailable,
+    DmaTimerUnavailable,
+    ConfigurationFailed,
+    StartFailed,
+    InvalidWrite,
+    WriteTimeout,
+    DrainTimeout,
+};
+
 // Wrap a configured, idle Arduino-Pico output. Use one core for the entire
 // audio lifecycle, including any other Arduino-Pico audio devices in the sketch.
 class AudioOutputBaseSink : public AudioSink {
@@ -66,21 +94,33 @@ public:
     void end() override;
     size_t writeSamples(const int16_t *samples, size_t count) override;
     void flush() override;
+    void flushUntil(AudioStopCheck stop, void *userData) override;
     bool discard() override;
     bool ready() const override;
+    AudioError lastError() const;
+    const char *lastErrorText() const override;
+    // Return and clear the sticky underrun observed during writes. This samples
+    // the driver's flag after the first two buffers, excluding idle and drain.
+    bool takeUnderrun();
 
 protected:
     explicit AudioOutputBaseSink(bool stereo);
     void attachOutput(AudioOutputBase &output);
+    bool fail(AudioError error);
 
 private:
+    size_t writePcm(const int16_t *samples, size_t count, AudioStopCheck stop, void *userData);
+
     AudioOutputBase *_output = nullptr;
     bool _ready = false;
     bool _stereo;
     bool _pending = false;
-    size_t _buffers = 4;
-    size_t _bufferWords = 64;
+    bool _underrun = false;
+    AudioError _lastError = AudioError::None;
+    size_t _buffers = 6;
+    size_t _bufferWords = 128;
     size_t _bufferOffset = 0;
+    size_t _primedFrames = 0;
     int _sampleRate = 0;
     int _writeCapacity = 0;
     uint32_t _writeTimeoutMs = 0;
@@ -99,10 +139,18 @@ private:
     pin_size_t _pin;
 };
 
+enum class I2SFormat {
+    Standard,
+    LeftJustified,
+};
+
 class I2SSink final : public AudioOutputBaseSink {
 public:
     // The word-select GPIO is bitClock + 1. Both channels carry the same PCM.
     I2SSink(pin_size_t bitClock, pin_size_t dataOut);
+    // The clock GPIOs must be adjacent. Specify their actual signal order.
+    I2SSink(pin_size_t bitClock, pin_size_t wordSelect, pin_size_t dataOut,
+            I2SFormat format = I2SFormat::Standard);
     bool begin(int sampleRate) override;
 
 private:
@@ -110,7 +158,9 @@ private:
 
     I2S _i2s;
     pin_size_t _bitClock;
+    pin_size_t _wordSelect;
     pin_size_t _dataOut;
+    I2SFormat _format;
 };
 #endif
 
@@ -122,9 +172,11 @@ using espeak::playTestTone;
 
 #if ESPEAK_ARDUINO_HAS_AUDIOOUTPUTBASE
 using ESpeakAudioOutputBaseSink = espeak::AudioOutputBaseSink;
+using ESpeakAudioError = espeak::AudioError;
 #endif
 
 #if ESPEAK_ARDUINO_HAS_AUDIOOUTPUTBASE && defined(ARDUINO_ARCH_RP2040)
 using ESpeakPWMSink = espeak::PWMSink;
 using ESpeakI2SSink = espeak::I2SSink;
+using ESpeakI2SFormat = espeak::I2SFormat;
 #endif

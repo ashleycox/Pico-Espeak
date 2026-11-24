@@ -2,7 +2,7 @@
 #include <ESpeakArduino.h>
 
 // Connect GP10 to BCLK, GP11 to LRCLK and GP12 to DIN on an I2S amplifier.
-ESpeakI2SSink audio(10, 12);
+ESpeakI2SSink audio(10, 11, 12);
 ESpeakSynth speech;
 
 void setup()
