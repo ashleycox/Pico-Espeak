@@ -22,6 +22,7 @@ public:
     bool ready() const override;
     const char *lastErrorText() const override { return _error; }
 
+    bool finalized() const { return _finalized; }
     uint32_t samplesRecorded() const { return _committedBytes / sizeof(int16_t); }
 
 private:
@@ -34,6 +35,7 @@ private:
     uint32_t _dataBytes = 0;
     uint32_t _committedBytes = 0;
     bool _active = false;
+    bool _finalized = false;
 };
 
 } // namespace espeak

@@ -28,9 +28,9 @@ buffer starvation, but it gives no count or duration.
 Include `ESpeakWav.h` and give an `ESpeakWavSink` an empty, writable file
 from an Arduino-Pico filesystem such as LittleFS. Keep the file open until
 `speech.end()` returns. A recording uses one sample rate and can contain
-several calls to `say()`. Each successful utterance updates the WAV header.
-Stopping an utterance removes its partial samples and keeps the earlier
-completed speech.
+several calls to `say()`. Stopping an utterance removes its partial samples
+and keeps the earlier completed speech. `speech.end()` writes the final WAV
+header. Check `wav.finalized()` before treating the recording as complete.
 
 ```cpp
 File output = LittleFS.open("/announcement.wav", "w+");
@@ -39,14 +39,20 @@ ESpeakSynth speech;
 if (speech.begin(wav)) {
     speech.say("Next stop, Central Station.");
     speech.end();
+    if (!wav.finalized()) {
+        Serial.println(wav.lastErrorText());
+    }
 }
 output.close();
 ```
 
 Run the [RecordToWav example](../examples/RecordToWav/RecordToWav.ino) on core
 0. Use a flash layout with a filesystem partition and enough sketch space for
-your voice pack. For a 2 MB Pico, the example fits in **Sketch: 1792KB, FS:
-256KB**. The example preserves existing files and expects formatted LittleFS.
+your voice pack. On a 2 MB Pico, select **Sketch: 1536KB, FS: 512KB**.
+At 22.05 kHz, speech uses about 44 KB per second. LittleFS copies the file
+when the WAV header is finalized, so allow about twice the recording's size
+in free space. The example preserves existing
+files and expects formatted LittleFS.
 To initialize a newly reserved, empty partition, set
 `initializeBlankPartition` to `true` for the first upload. Leave it
 `false` when the partition contains files you want to keep.

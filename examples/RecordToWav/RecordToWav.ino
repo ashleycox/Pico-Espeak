@@ -38,6 +38,10 @@ void setup()
 
     speech.end();
     file.close();
+    if (!wav.finalized()) {
+        Serial.println(wav.lastErrorText());
+        return;
+    }
     Serial.printf("Saved /speech.wav with %lu samples.\n",
                   static_cast<unsigned long>(wav.samplesRecorded()));
 }

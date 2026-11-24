@@ -19,7 +19,7 @@ int main()
     wav.flush();
     const auto completed = file.bytes;
     assert(wav.samplesRecorded() == 5 && file.size() == 54);
-    assert(file.bytes[4] == 46 && file.bytes[40] == 10);
+    assert(!wav.finalized() && file.bytes[4] == 36 && file.bytes[40] == 0);
     assert(file.bytes[46] == 0xff && file.bytes[47] == 0x7f);
     assert(file.bytes[48] == 0x00 && file.bytes[49] == 0x80);
 
@@ -39,6 +39,10 @@ int main()
     assert(wav.discard());
     assert(file.bytes == saved);
     wav.end();
+    assert(wav.finalized());
+    assert(file.size() == 56 && file.bytes[4] == 48 && file.bytes[40] == 12);
+    assert(std::memcmp(file.bytes.data() + 44, saved.data() + 44, 12) == 0);
+    const auto finalized = file.bytes;
     assert(!wav.begin(44100)); // The caller must supply an empty file.
-    assert(file.bytes == saved);
+    assert(file.bytes == finalized);
 }

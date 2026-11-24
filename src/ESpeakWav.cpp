@@ -28,6 +28,7 @@ bool espeak::WavSink::begin(int sampleRate)
         return fail("WAV output needs an empty writable file and a positive sample rate");
     }
     _error = nullptr;
+    _finalized = false;
     _sampleRate = static_cast<uint32_t>(sampleRate);
     _dataBytes = _committedBytes = 0;
     _active = writeHeader(0);
@@ -36,7 +37,17 @@ bool espeak::WavSink::begin(int sampleRate)
 
 void espeak::WavSink::end()
 {
+    if (!_active) {
+        return;
+    }
     flush();
+    if (_dataBytes != _committedBytes) {
+        discard();
+    }
+    if (_dataBytes == _committedBytes && writeHeader(_committedBytes)) {
+        _file.flush();
+        _finalized = true;
+    }
     _active = false;
 }
 
@@ -76,10 +87,10 @@ void espeak::WavSink::flush()
     if (!ready() || _dataBytes == _committedBytes) {
         return;
     }
-    if (writeHeader(_dataBytes)) {
-        _file.flush();
-        _committedBytes = _dataBytes;
-    }
+    // LittleFS copies the whole file when bytes near the front are
+    // overwritten. Commit the samples now and write their sizes in end().
+    _file.flush();
+    _committedBytes = _dataBytes;
 }
 
 bool espeak::WavSink::discard()
@@ -91,7 +102,7 @@ bool espeak::WavSink::discard()
         return true;
     }
     const uint32_t length = headerBytes + _committedBytes;
-    if (!_file.truncate(length) || !writeHeader(_committedBytes)) {
+    if (!_file.truncate(length) || !_file.seek(length)) {
         return fail("Could not restore the WAV file to the last completed utterance");
     }
     _file.flush();
