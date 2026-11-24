@@ -25,8 +25,9 @@ Arduino-Pico 6.4.0 and eSpeak NG 1.53.0 development sources. [Source revision](N
 
 Connect the Pico's ground to the audio circuit's ground. Use an amplifier for
 a speaker. For I2S, choose a DAC or amplifier that accepts 16-bit I2S at
-22.05 kHz with BCLK and LRCLK. The word-select GPIO is always one higher
-than BCLK. Both channels carry the same speech.
+22.05 kHz with BCLK and LRCLK. The two clock pins must be adjacent.
+Both channels carry the same speech. The two-argument I2S constructor uses
+BCLK + 1 for word select.
 
 [Arduino-Pico PWM audio](https://arduino-pico.readthedocs.io/en/latest/pwm.html) ·
 [Arduino-Pico I2S audio](https://arduino-pico.readthedocs.io/en/latest/i2s.html)
@@ -56,11 +57,13 @@ void loop() {}
 `say()` waits for speech to finish. If your sketch needs to read buttons or
 refresh a display during playback, use `ESpeakBackgroundSynth` on the second
 core. The `BackgroundMenu` example changes rate, volume, pitch and voice from
-the serial port and can interrupt an announcement.
+the serial port. It also shows how to track and cancel an announcement by
+ticket.
 
 The [API guide](docs/api.md) covers voice menus, speech settings, custom PCM
-sinks, SSML and phoneme output. To speak another language, [build a voice pack](docs/data-packs.md)
-with the languages you need.
+sinks, SSML and phoneme output. The [audio guide](docs/audio.md) covers WAV
+recording, I2S formats and buffering. To speak other languages, [build a voice
+pack](docs/data-packs.md) and put it in the sketch or a separate flash partition.
 
 ## License
 

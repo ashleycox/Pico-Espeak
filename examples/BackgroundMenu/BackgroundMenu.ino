@@ -11,6 +11,7 @@ bool core1_separate_stack = true;
 static const char *voices[] = {"en", "en-us+f2", "en-us+m3"};
 static size_t voice = 0;
 static ESpeakSettings settings;
+static ESpeakSpeechTicket announcement = 0;
 
 void setup()
 {
@@ -35,6 +36,13 @@ void loop()
         Serial.println("R/r: rate up/down | V/v: volume up/down | P/p: pitch up/down");
         Serial.println("N: next voice | Space: speak | X: stop");
     }
+    if (announcement) {
+        const ESpeakSpeechResult result = speech.result(announcement);
+        if (result.finished()) {
+            Serial.printf("Announcement: %s\n", ESpeakSynth::statusCodeMessage(result.status).c_str());
+            announcement = 0;
+        }
+    }
     if (!Serial.available()) {
         return;
     }
@@ -56,12 +64,18 @@ void loop()
             }
             return;
         }
-        case ' ':
-            speech.speakNow("You can still use the menu while this sentence is playing.");
+        case ' ': {
+            const auto ticket = speech.submitNow("You can still use the menu while this sentence is playing.");
+            if (ticket) {
+                announcement = ticket;
+            }
             return;
+        }
         case 'X':
         case 'x':
-            speech.stop();
+            if (announcement) {
+                speech.cancel(announcement);
+            }
             return;
         default:
             return;
@@ -75,6 +89,7 @@ void loop()
 
 void setup1()
 {
+    speech.setMaxTextBytes(256);
     speech.begin(audio);
 }
 

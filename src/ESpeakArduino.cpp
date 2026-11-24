@@ -16,6 +16,8 @@ extern "C" int GetFileLength(const char *filename);
 namespace espeak {
 namespace {
 
+constexpr uint32_t stopWindowClosed = 1;
+
 unsigned int currentCore()
 {
 #if __has_include(<pico/multicore.h>)
@@ -23,6 +25,17 @@ unsigned int currentCore()
 #else
     return 0;
 #endif
+}
+
+bool speechStopped(void *context)
+{
+    return static_cast<Synth *>(context)->stopRequested();
+}
+
+const char *flashText(const __FlashStringHelper *text)
+{
+    // Arduino-Pico stores flash strings in directly addressable flash.
+    return reinterpret_cast<const char *>(text);
 }
 
 espeak_ERROR legacyError(espeak_ng_STATUS status)
@@ -214,9 +227,10 @@ bool Synth::begin(AudioSink &sink, const Config &config)
         return false;
     }
     if (!sink.begin(_sampleRate)) {
+        audioFailure(&sink, "audio output did not start");
         sink.end();
         end();
-        return fail(EE_INTERNAL_ERROR, "audio output did not start", ENS_AUDIO_ERROR);
+        return false;
     }
     _sink = &sink;
     return rememberStatus(ENS_OK);
@@ -267,9 +281,10 @@ bool Synth::setAudioSink(AudioSink &sink)
         _sink = &sink;
         return rememberStatus(ENS_OK);
     }
+    audioFailure(&sink, "audio output did not start");
     sink.end();
     _sink = previous != nullptr && previous->begin(_sampleRate) ? previous : nullptr;
-    return fail(EE_INTERNAL_ERROR, "audio output did not start", ENS_AUDIO_ERROR);
+    return false;
 }
 
 AudioSink *Synth::audioSink() const
@@ -378,7 +393,7 @@ bool Synth::synchronize()
     if (_sink != nullptr) {
         _sink->flush();
         if (!_sink->ready()) {
-            return fail(EE_INTERNAL_ERROR, "audio output did not drain", ENS_AUDIO_ERROR);
+            return audioFailure(_sink, "audio output did not drain");
         }
     }
     return rememberStatus(espeak_ng_Synchronize());
@@ -394,23 +409,30 @@ bool Synth::cancel()
         return false;
     }
     if (_sink != nullptr && !_sink->discard()) {
-        return fail(EE_INTERNAL_ERROR, "audio output could not discard pending samples", ENS_AUDIO_ERROR);
+        return audioFailure(_sink, "audio output could not discard pending samples");
     }
     return rememberStatus(ENS_OK);
 }
 
 void Synth::requestStop()
 {
-    if (isPlaying()) {
-        auto requested = static_cast<uint32_t>(micros());
-        uint32_t pending = 0;
-        _stopRequestMicros.compare_exchange_strong(pending, requested != 0 ? requested : UINT32_MAX);
+    tryRequestStop();
+}
+
+bool Synth::tryRequestStop()
+{
+    if (!isPlaying()) {
+        return false;
     }
+    const auto now = static_cast<uint32_t>(micros());
+    const uint32_t requested = now > stopWindowClosed ? now : UINT32_MAX;
+    uint32_t pending = 0;
+    return _stopRequestMicros.compare_exchange_strong(pending, requested) || pending > stopWindowClosed;
 }
 
 bool Synth::stopRequested() const
 {
-    return _stopRequestMicros.load() != 0;
+    return _stopRequestMicros.load() > stopWindowClosed;
 }
 
 uint32_t Synth::lastStopLatencyMicros() const
@@ -1042,9 +1064,9 @@ bool Synth::startSpeech()
         return false;
     }
     if (_sink == nullptr || !_sink->ready()) {
-        return fail(EE_INTERNAL_ERROR, "audio output is unavailable", ENS_AUDIO_ERROR);
+        return audioFailure(_sink, "audio output is unavailable");
     }
-    _callbackError = nullptr;
+    _audioFault = false;
     _stopRequestMicros = 0;
     _playing = true;
     return true;
@@ -1070,26 +1092,30 @@ bool Synth::selectInitialVoice(const char *language)
 bool Synth::finishSpeech(espeak_ng_STATUS status)
 {
     if (status == ENS_OK && !stopRequested()) {
-        _sink->flush();
+        _sink->flushUntil(speechStopped, this);
         if (!_sink->ready()) {
-            _callbackError = "audio output did not drain";
+            audioFailure(_sink, "audio output did not drain");
         }
     }
-    if (status != ENS_OK || stopRequested() || _callbackError != nullptr) {
-        if (!_sink->discard() && _callbackError == nullptr) {
-            _callbackError = "audio output could not discard pending samples";
+    // Close the stop window before discarding or publishing the final result.
+    uint32_t requested = 0;
+    _stopRequestMicros.compare_exchange_strong(requested, stopWindowClosed);
+    const bool interrupted = requested > stopWindowClosed;
+    if (status != ENS_OK || interrupted || _audioFault) {
+        if (!_sink->discard() && !_audioFault) {
+            audioFailure(_sink, "audio output could not discard pending samples");
         }
     }
     _playing = false;
-    if (const uint32_t requested = _stopRequestMicros.load()) {
+    if (interrupted) {
         _lastStopLatencyMicros = static_cast<uint32_t>(micros()) - requested;
         ++_stopCount;
         if (status == ENS_OK) {
             status = ENS_SPEECH_STOPPED;
         }
     }
-    if (_callbackError != nullptr) {
-        return fail(EE_INTERNAL_ERROR, _callbackError, ENS_AUDIO_ERROR);
+    if (_audioFault) {
+        return false;
     }
     return rememberStatus(status);
 }
@@ -1110,9 +1136,9 @@ int Synth::synthCallback(short *wav, int sampleCount, espeak_EVENT *events)
     }
     for (auto *event = events; event != nullptr && event->type != espeakEVENT_LIST_TERMINATED; ++event) {
         if (event->type == espeakEVENT_SAMPLERATE && event->id.number > 0 && event->id.number != _sampleRate) {
-            _sink->flush();
+            _sink->flushUntil(speechStopped, this);
             if (!_sink->ready()) {
-                _callbackError = "audio output did not drain before changing sample rate";
+                audioFailure(_sink, "audio output did not drain before changing sample rate");
                 return 1;
             }
             if (stopRequested()) {
@@ -1120,7 +1146,7 @@ int Synth::synthCallback(short *wav, int sampleCount, espeak_EVENT *events)
             }
             _sink->end();
             if (!_sink->begin(event->id.number)) {
-                _callbackError = "audio output could not change sample rate";
+                audioFailure(_sink, "audio output could not change sample rate");
                 return 1;
             }
             _sampleRate = event->id.number;
@@ -1141,7 +1167,7 @@ int Synth::synthCallback(short *wav, int sampleCount, espeak_EVENT *events)
             }
             const size_t chunk = min(size_t{32}, count - offset);
             if (_sink->writeSamples(samples + offset, chunk) != chunk) {
-                _callbackError = "audio output did not accept the samples";
+                audioFailure(_sink, "audio output did not accept the samples");
                 return 1;
             }
             offset += chunk;
@@ -1188,6 +1214,13 @@ bool Synth::fail(espeak_ERROR error, const char *message, espeak_ng_STATUS statu
     snprintf(_lastErrorMessage, sizeof(_lastErrorMessage), "%s", message);
     snprintf(_lastStatusMessage, sizeof(_lastStatusMessage), "%s", message);
     return false;
+}
+
+bool Synth::audioFailure(const AudioSink *sink, const char *fallback)
+{
+    const char *detail = sink != nullptr ? sink->lastErrorText() : nullptr;
+    _audioFault = true;
+    return fail(EE_INTERNAL_ERROR, detail != nullptr && detail[0] != '\0' ? detail : fallback, ENS_AUDIO_ERROR);
 }
 
 bool Synth::rememberStatus(espeak_ng_STATUS status)
@@ -1303,6 +1336,7 @@ void BackgroundSynth::loop()
                 --_count;
                 if (command.type == CommandSpeak) {
                     --_speechCount;
+                    _activeTicket = command.ticket;
                     prepared = _synth.startSpeech();
                 }
             }
@@ -1330,6 +1364,16 @@ void BackgroundSynth::loop()
     }
     QueueLock lock(*this);
     recordResult();
+    if (command.ticket != 0) {
+        SpeechState outcome = SpeechState::Failed;
+        if (_lastStatus == ENS_OK) {
+            outcome = SpeechState::Completed;
+        } else if (_lastStatus == ENS_SPEECH_STOPPED) {
+            outcome = SpeechState::Cancelled;
+        }
+        addCompletion(command.ticket, {outcome, _lastStatus});
+        _activeTicket = 0;
+    }
     _workerBusy = false;
 }
 
@@ -1405,8 +1449,7 @@ bool BackgroundSynth::say(const char *text, unsigned int flags)
 
 bool BackgroundSynth::say(const __FlashStringHelper *text, unsigned int flags)
 {
-    const String copy(text);
-    return say(copy.c_str(), flags);
+    return say(flashText(text), flags);
 }
 
 bool BackgroundSynth::speakNow(const char *text, unsigned int flags)
@@ -1416,8 +1459,76 @@ bool BackgroundSynth::speakNow(const char *text, unsigned int flags)
 
 bool BackgroundSynth::speakNow(const __FlashStringHelper *text, unsigned int flags)
 {
-    const String copy(text);
-    return speakNow(copy.c_str(), flags);
+    return speakNow(flashText(text), flags);
+}
+
+SpeechTicket BackgroundSynth::submit(const char *text, unsigned int flags)
+{
+    SpeechTicket ticket = 0;
+    enqueueSpeech(text, flags, false, &ticket);
+    return ticket;
+}
+
+SpeechTicket BackgroundSynth::submit(const __FlashStringHelper *text, unsigned int flags)
+{
+    return submit(flashText(text), flags);
+}
+
+SpeechTicket BackgroundSynth::submitNow(const char *text, unsigned int flags)
+{
+    SpeechTicket ticket = 0;
+    enqueueSpeech(text, flags, true, &ticket);
+    return ticket;
+}
+
+SpeechTicket BackgroundSynth::submitNow(const __FlashStringHelper *text, unsigned int flags)
+{
+    return submitNow(flashText(text), flags);
+}
+
+SpeechResult BackgroundSynth::result(SpeechTicket ticket) const
+{
+    QueueLock lock(*this);
+    return ticketResult(ticket);
+}
+
+bool BackgroundSynth::cancel(SpeechTicket ticket)
+{
+    if (ticket == 0) {
+        return false;
+    }
+    QueueLock lock(*this);
+    if (_activeTicket == ticket) {
+        return _synth.tryRequestStop();
+    }
+
+    const size_t capacity = _speechCapacity + _commandCapacity;
+    for (size_t index = 0; index < _count; ++index) {
+        auto &command = _queue[(_head + index) % capacity];
+        if (command.ticket == ticket) {
+            cancelPending(command);
+            for (size_t next = index + 1; next < _count; ++next) {
+                _queue[(_head + next - 1) % capacity] = std::move(_queue[(_head + next) % capacity]);
+            }
+            --_count;
+            --_speechCount;
+            _queue[(_head + _count) % capacity] = Command{};
+            return true;
+        }
+    }
+    return false;
+}
+
+void BackgroundSynth::setMaxTextBytes(size_t bytes)
+{
+    QueueLock lock(*this);
+    _maxTextBytes = bytes;
+}
+
+size_t BackgroundSynth::maxTextBytes() const
+{
+    QueueLock lock(*this);
+    return _maxTextBytes;
 }
 
 bool BackgroundSynth::setCommandCapacity(size_t capacity)
@@ -1433,11 +1544,7 @@ bool BackgroundSynth::setVoice(const char *name)
 
 bool BackgroundSynth::setVoice(const __FlashStringHelper *name)
 {
-    if (name == nullptr) {
-        return false;
-    }
-    String copy(name);
-    return setVoice(copy.c_str());
+    return setVoice(flashText(name));
 }
 
 bool BackgroundSynth::setVoiceFile(const char *filename)
@@ -1447,11 +1554,7 @@ bool BackgroundSynth::setVoiceFile(const char *filename)
 
 bool BackgroundSynth::setVoiceFile(const __FlashStringHelper *filename)
 {
-    if (filename == nullptr) {
-        return false;
-    }
-    String copy(filename);
-    return setVoiceFile(copy.c_str());
+    return setVoiceFile(flashText(filename));
 }
 
 bool BackgroundSynth::setLanguage(const char *language)
@@ -1461,11 +1564,7 @@ bool BackgroundSynth::setLanguage(const char *language)
 
 bool BackgroundSynth::setLanguage(const __FlashStringHelper *language)
 {
-    if (language == nullptr) {
-        return false;
-    }
-    String copy(language);
-    return setLanguage(copy.c_str());
+    return setLanguage(flashText(language));
 }
 
 bool BackgroundSynth::setVariant(const char *variant)
@@ -1475,11 +1574,7 @@ bool BackgroundSynth::setVariant(const char *variant)
 
 bool BackgroundSynth::setVariant(const __FlashStringHelper *variant)
 {
-    if (variant == nullptr) {
-        return false;
-    }
-    String copy(variant);
-    return setVariant(copy.c_str());
+    return setVariant(flashText(variant));
 }
 
 bool BackgroundSynth::setParameter(espeak_PARAMETER parameter, int value, bool relative)
@@ -1631,24 +1726,51 @@ bool BackgroundSynth::push(Command &&command)
     return true;
 }
 
-bool BackgroundSynth::enqueueSpeech(const char *text, unsigned int flags, bool replace)
+bool BackgroundSynth::copyQueuedText(String &destination, const char *text, size_t limit)
+{
+    const size_t length = limit == 0 || limit == SIZE_MAX ? strlen(text) : strnlen(text, limit + 1);
+    if (limit != 0 && length > limit) {
+        return false;
+    }
+    destination = text;
+    return destination.length() == length;
+}
+
+bool BackgroundSynth::enqueueSpeech(const char *text, unsigned int flags, bool replace, SpeechTicket *ticket)
 {
     if (text == nullptr || text[0] == '\0') {
         return false;
     }
+    const auto canEnqueue = [&]() {
+        return _state == Running && _speechCapacity > 0 && (replace || _speechCount < _speechCapacity);
+    };
+    size_t limit;
+    {
+        QueueLock lock(*this);
+        if (!canEnqueue()) {
+            return false;
+        }
+        limit = _maxTextBytes;
+    }
     Command command;
-    command.text = text;
     command.flags = flags;
-    if (command.text.length() != strlen(text)) {
+    if (!copyQueuedText(command.text, text, limit)) {
         return false;
     }
     QueueLock lock(*this);
-    if (_state != Running || _speechCapacity == 0) {
+    if (!canEnqueue() || (_maxTextBytes != 0 && command.text.length() > _maxTextBytes)) {
         return false;
     }
     if (replace) {
         removePendingSpeech();
         _synth.requestStop();
+    }
+    if (ticket != nullptr) {
+        do {
+            ++_nextTicket;
+        } while (_nextTicket == 0 || ticketResult(_nextTicket).state != SpeechState::Unknown);
+        command.ticket = _nextTicket;
+        *ticket = _nextTicket;
     }
     return push(std::move(command));
 }
@@ -1658,14 +1780,59 @@ bool BackgroundSynth::queueTextCommand(CommandType type, const char *text)
     if (text == nullptr || (text[0] == '\0' && type != CommandSetVariant)) {
         return false;
     }
+    size_t limit;
+    {
+        QueueLock lock(*this);
+        if (_state != Running || _count - _speechCount == _commandCapacity) {
+            return false;
+        }
+        limit = _maxTextBytes;
+    }
     Command command;
     command.type = type;
-    command.text = text;
-    if (command.text.length() != strlen(text)) {
+    if (!copyQueuedText(command.text, text, limit)) {
         return false;
     }
     QueueLock lock(*this);
+    if (_maxTextBytes != 0 && command.text.length() > _maxTextBytes) {
+        return false;
+    }
     return push(std::move(command));
+}
+
+SpeechResult BackgroundSynth::ticketResult(SpeechTicket ticket) const
+{
+    if (ticket == 0) {
+        return {};
+    }
+    if (ticket == _activeTicket) {
+        return {SpeechState::Speaking, ENS_OK};
+    }
+    const size_t capacity = _speechCapacity + _commandCapacity;
+    for (size_t i = 0; i < _count; ++i) {
+        if (_queue[(_head + i) % capacity].ticket == ticket) {
+            return {SpeechState::Queued, ENS_OK};
+        }
+    }
+    for (const auto &completion : _completions) {
+        if (completion.ticket == ticket) {
+            return completion.result;
+        }
+    }
+    return {};
+}
+
+void BackgroundSynth::addCompletion(SpeechTicket ticket, SpeechResult result)
+{
+    if (ticket != 0) {
+        _completions[_nextCompletion] = {ticket, result};
+        _nextCompletion = (_nextCompletion + 1) % resultHistoryCapacity;
+    }
+}
+
+void BackgroundSynth::cancelPending(const Command &command)
+{
+    addCompletion(command.ticket, {SpeechState::Cancelled, ENS_SPEECH_STOPPED});
 }
 
 void BackgroundSynth::removePendingSpeech()
@@ -1677,7 +1844,9 @@ void BackgroundSynth::removePendingSpeech()
     size_t retained = 0;
     for (size_t i = 0; i < _count; ++i) {
         const size_t index = (_head + i) % capacity;
-        if (_queue[index].type != CommandSpeak) {
+        if (_queue[index].type == CommandSpeak) {
+            cancelPending(_queue[index]);
+        } else {
             if (retained != i) {
                 _queue[(_head + retained) % capacity] = std::move(_queue[index]);
             }
@@ -1694,7 +1863,9 @@ void BackgroundSynth::removePendingSpeech()
 void BackgroundSynth::clear()
 {
     for (size_t i = 0; i < _count; ++i) {
-        _queue[(_head + i) % (_speechCapacity + _commandCapacity)] = Command{};
+        auto &command = _queue[(_head + i) % (_speechCapacity + _commandCapacity)];
+        cancelPending(command);
+        command = Command{};
     }
     _head = 0;
     _count = 0;

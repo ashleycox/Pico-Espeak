@@ -14,9 +14,10 @@ arduino-cli core update-index --additional-urls "$index"
 arduino-cli core install rp2040:rp2040@6.4.0 --additional-urls "$index"
 arduino-cli compile --fqbn rp2040:rp2040:rpipico --library . examples/BasicPico
 tests/run-host.sh
+python3 -m unittest discover -s tests -p test_pack_generator.py
 ```
 
-The host test exercises the bundled engine and flash data without a board.
+The host tests exercise synthesis, flash images, queue cancellation and WAV files without a board.
 Use `SANITIZE=1 tests/run-host.sh` with Clang or GCC to check memory use.
 If you change playback, try a short and a long announcement over PWM and
 I2S. Check that the final syllables play, then interrupt a long announcement

@@ -13,7 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: tests/run-host.sh
+      - run: CC=clang CXX=clang++ SANITIZE=1 tests/run-host.sh
+      - run: python3 -m unittest discover -s tests -p test_pack_generator.py
 
   pico:
     runs-on: ubuntu-latest
@@ -39,6 +40,13 @@ jobs:
         env:
           BOARD: ${{ matrix.board }}
         run: |
+          case "$BOARD" in rpipico2*) flash=4194304 ;; *) flash=2097152 ;; esac
+          case "$BOARD" in *:*) separator=, ;; *) separator=: ;; esac
           for sketch in examples/*/; do
-            arduino-cli compile --fqbn "rp2040:rp2040:$BOARD" --library "$GITHUB_WORKSPACE" "$sketch"
+            board="$BOARD"
+            case "$(basename "$sketch")" in
+              FlashVoicePack) board="$BOARD${separator}flash=${flash}_1048576" ;;
+              RecordToWav) board="$BOARD${separator}flash=${flash}_262144" ;;
+            esac
+            arduino-cli compile --fqbn "rp2040:rp2040:$board" --library "$GITHUB_WORKSPACE" "$sketch"
           done

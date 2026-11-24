@@ -43,6 +43,26 @@ struct Settings {
     int ssmlBreakMultiplier = 100;
 };
 
+using SpeechTicket = uint32_t;
+
+enum class SpeechState : uint8_t {
+    Unknown,
+    Queued,
+    Speaking,
+    Completed,
+    Cancelled,
+    Failed,
+};
+
+struct SpeechResult {
+    SpeechState state = SpeechState::Unknown;
+    espeak_ng_STATUS status = ENS_OK;
+
+    bool finished() const {
+        return state == SpeechState::Completed || state == SpeechState::Cancelled || state == SpeechState::Failed;
+    }
+};
+
 using EventCallback = void (*)(const espeak_EVENT &event, void *userData);
 using PhonemeCallback = void (*)(const char *phoneme, void *userData);
 using UriCallback = int (*)(int type, const char *uri, const char *base, void *userData);
@@ -214,6 +234,7 @@ private:
     static int handlePhonemeCallback(const char *phoneme);
     static int handleUriCallback(int type, const char *uri, const char *base);
     int synthCallback(short *wav, int sampleCount, espeak_EVENT *events);
+    bool tryRequestStop();
     bool startSpeech();
     bool finishSpeech(espeak_ng_STATUS status);
     bool synthesizeQueued(const char *text, unsigned int flags);
@@ -221,6 +242,7 @@ private:
     bool checkIdle();
     bool selectInitialVoice(const char *language);
     bool fail(espeak_ERROR error, const char *message, espeak_ng_STATUS status = ENS_NOT_SUPPORTED);
+    bool audioFailure(const AudioSink *sink, const char *fallback);
     bool rememberStatus(espeak_ng_STATUS status);
     bool validateDataPack(const char *path);
 
@@ -235,7 +257,7 @@ private:
     unsigned int _defaultFlags = espeakCHARS_UTF8 | espeakENDPAUSE;
     int _sampleRate = 0;
     espeak_ERROR _lastError = EE_OK;
-    const char *_callbackError = nullptr;
+    bool _audioFault = false;
     char _lastErrorMessage[160] = {};
     espeak_ng_STATUS _lastStatus = ENS_OK;
     char _lastStatusMessage[160] = {};
@@ -293,6 +315,21 @@ public:
     bool speakNow(const __FlashStringHelper *text, unsigned int flags = 0);
     void stop(bool clearPending = true);
 
+    // Returns zero when the queue cannot accept the request.
+    SpeechTicket submit(const char *text, unsigned int flags = 0);
+    SpeechTicket submit(const String &text, unsigned int flags = 0) { return submit(text.c_str(), flags); }
+    SpeechTicket submit(const __FlashStringHelper *text, unsigned int flags = 0);
+    SpeechTicket submitNow(const char *text, unsigned int flags = 0);
+    SpeechTicket submitNow(const String &text, unsigned int flags = 0) { return submitNow(text.c_str(), flags); }
+    SpeechTicket submitNow(const __FlashStringHelper *text, unsigned int flags = 0);
+    SpeechResult result(SpeechTicket ticket) const;
+    bool cancel(SpeechTicket ticket);
+    static constexpr size_t resultHistoryCapacity = 8;
+
+    // Limits future queue entries that carry text. Zero allows any length.
+    void setMaxTextBytes(size_t bytes);
+    size_t maxTextBytes() const;
+
     bool setCommandCapacity(size_t capacity);
     bool setVoice(const char *name);
     bool setVoice(const __FlashStringHelper *name);
@@ -339,6 +376,7 @@ private:
     struct Command {
         CommandType type = CommandSpeak;
         String text;
+        SpeechTicket ticket = 0;
         espeak_PARAMETER parameter = espeakRATE;
         long value = 0;
         bool relative = false;
@@ -348,10 +386,19 @@ private:
         espeak_ng_OUTPUT_HOOKS hooks = {};
     };
 
+    struct Completion {
+        SpeechTicket ticket = 0;
+        SpeechResult result;
+    };
+
     bool resizeQueue(size_t speechCapacity, size_t commandCapacity);
     bool push(Command &&command);
-    bool enqueueSpeech(const char *text, unsigned int flags, bool replace);
+    bool enqueueSpeech(const char *text, unsigned int flags, bool replace, SpeechTicket *ticket = nullptr);
     bool queueTextCommand(CommandType type, const char *text);
+    static bool copyQueuedText(String &destination, const char *text, size_t limit);
+    SpeechResult ticketResult(SpeechTicket ticket) const;
+    void addCompletion(SpeechTicket ticket, SpeechResult result);
+    void cancelPending(const Command &command);
     void removePendingSpeech();
     void clear();
     void recordResult();
@@ -367,6 +414,11 @@ private:
     size_t _head = 0;
     size_t _count = 0;
     size_t _speechCount = 0;
+    size_t _maxTextBytes = 0;
+    SpeechTicket _nextTicket = 0;
+    SpeechTicket _activeTicket = 0;
+    Completion _completions[resultHistoryCapacity];
+    size_t _nextCompletion = 0;
     Settings _settings;
     espeak_ERROR _lastError = EE_OK;
     espeak_ng_STATUS _lastStatus = ENS_OK;
@@ -382,6 +434,9 @@ private:
 
 using ESpeakConfig = espeak::Config;
 using ESpeakSettings = espeak::Settings;
+using ESpeakSpeechState = espeak::SpeechState;
+using ESpeakSpeechTicket = espeak::SpeechTicket;
+using ESpeakSpeechResult = espeak::SpeechResult;
 using ESpeakSynth = espeak::Synth;
 using ESpeakBackgroundSynth = espeak::BackgroundSynth;
 using ESpeakEventCallback = espeak::EventCallback;

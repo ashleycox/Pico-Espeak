@@ -48,6 +48,26 @@ alive until that core finishes shutdown. After calling `end()`, keep running
 the worker loop until `isStopped()` returns true. See [the menu sketch](../examples/BackgroundMenu/BackgroundMenu.ino)
 and [Arduino-Pico's multicore guide](https://arduino-pico.readthedocs.io/en/latest/multicore.html).
 
+For a menu that needs to track specific announcements, call `submit(text)` or
+`submitNow(text)`. Both return a ticket, or zero if the queue rejects the
+request. Call `result(ticket)` from the menu to read its state and native
+eSpeak status. `cancel(ticket)` targets one queued or active announcement.
+The worker retains the eight most recent ticketed results. Older tickets
+return `Unknown`.
+
+```cpp
+ESpeakSpeechTicket announcement = speech.submit("Battery low.");
+// In loop(), after a successful submission:
+const auto result = speech.result(announcement);
+if (result.finished()) {
+    Serial.println(ESpeakSynth::statusCodeMessage(result.status));
+}
+```
+
+`setMaxTextBytes(256)` caps the size of future queued text and voice names
+before the library copies them. The limit counts bytes, so a UTF-8 code point
+can count as more than one. Zero restores the default of unlimited text size.
+
 ## Work with speech data
 
 - `synthesize(text, espeakCHARS_UTF8 | espeakSSML)` handles SSML. Include
@@ -61,7 +81,10 @@ and [Arduino-Pico's multicore guide](https://arduino-pico.readthedocs.io/en/late
 - `AudioSink::writeSamples()` receives signed 16-bit mono PCM at
   `sampleRate()`. Return the number of samples accepted. The engine checks
   short writes. A custom sink can drain pending audio in `flush()` and drop
-  it on interruption in `discard()`.
+  it on interruption in `discard()`. To support interruption during a long
+  drain, override `flushUntil()` and co-operate with its stop check.
+  `lastErrorText()` can provide the specific cause of a sink failure. See
+  the [audio guide](audio.md) for WAV output and DMA buffering.
 
 The C APIs in [`speak_lib.h`](../src/espeak-ng/speak_lib.h) and
 [`espeak_ng.h`](../src/espeak-ng/espeak_ng.h) expose the bundled engine.
