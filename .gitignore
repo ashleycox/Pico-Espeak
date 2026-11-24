@@ -1,0 +1,5 @@
+.DS_Store
+.build/
+.upstream/
+dist/
+__pycache__/

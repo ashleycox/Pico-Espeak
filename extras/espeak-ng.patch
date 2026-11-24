@@ -1,0 +1,1527 @@
+diff --git a/src/libespeak-ng/common.c b/src/libespeak-ng/common.c
+index 4696d856..73336aa0 100644
+--- a/src/libespeak-ng/common.c
++++ b/src/libespeak-ng/common.c
+@@ -38,10 +38,17 @@
+ #include "common.h"
+ #include "translate.h"
+ 
++#include <espeak-ng/pico_data.h>
++
+ #pragma GCC visibility push(default)
+ 
+ int GetFileLength(const char *filename)
+ {
++#if PICO_ESPEAK_MAPPED_DATA
++	int result;
++	if (pico_espeak_file_length(filename, &result))
++		return result;
++#endif
+ 	struct stat statbuf;
+ 
+ 	if (stat(filename, &statbuf) != 0)
+diff --git a/src/libespeak-ng/compiledata.c b/src/libespeak-ng/compiledata.c
+index 0a5d7edf..91635234 100644
+--- a/src/libespeak-ng/compiledata.c
++++ b/src/libespeak-ng/compiledata.c
+@@ -48,6 +48,8 @@
+ #include "voice.h"                    // for LoadVoice, voice
+ #include "wavegen.h"                  // for WavegenInit, WavegenSetVoice
+ 
++#include <espeak-ng/pico_data.h>
++
+ static int CalculateSample(unsigned char c3, int c1);
+ 
+ #define N_ITEM_STRING 256
+diff --git a/src/libespeak-ng/compiledict.c b/src/libespeak-ng/compiledict.c
+index a227b3a1..7323f3f2 100644
+--- a/src/libespeak-ng/compiledict.c
++++ b/src/libespeak-ng/compiledict.c
+@@ -42,6 +42,8 @@
+ #include "speech.h"		// for path_home
+ #include "synthesize.h"           // for Write4Bytes
+ 
++#include <espeak-ng/pico_data.h>
++
+ static const MNEM_TAB mnem_rules[] = {
+ 	{ "unpr",     DOLLAR_UNPR },
+ 	{ "noprefix", DOLLAR_NOPREFIX },  // rule fails if a prefix has been removed
+@@ -1499,11 +1501,16 @@ static espeak_ng_STATUS compile_dictrules(CompileContext *ctx, FILE *f_in, FILE
+ 	int compile_mode = 0;
+ 	char *buf;
+ 	char buf1[500];
+-	char *rules[N_RULES];
+-
+ 	int n_rgroups = 0;
+ 	int n_groups3 = 0;
+-	RGROUP rgroup[N_RULE_GROUP2];
++	struct RuleWorkspace {
++		char *rules[N_RULES];
++		RGROUP groups[N_RULE_GROUP2];
++	} *workspace = malloc(sizeof(*workspace));
++	if (workspace == NULL)
++		return ENOMEM;
++	char **rules = workspace->rules;
++	RGROUP *rgroup = workspace->groups;
+ 
+ 	ctx->linenum = 0;
+ 	ctx->group_name[0] = 0;
+@@ -1673,12 +1680,15 @@ static espeak_ng_STATUS compile_dictrules(CompileContext *ctx, FILE *f_in, FILE
+ 	for (gp = 0; gp < n_rgroups; gp++) {
+ 		free(rgroup[gp].start);
+ 	}
++	free(workspace);
+ 	return ENS_OK;
+ }
+ 
+ #pragma GCC visibility push(default)
+ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_CompileDictionary(const char *dsource, const char *dict_name, FILE *log, int flags, espeak_ng_ERROR_CONTEXT *context)
+ {
++	if (translator == NULL)
++		return ENS_NOT_INITIALIZED;
+ 	if (!log) log = stderr;
+ 	if (!dict_name) dict_name = dictionary_name;
+ 
+diff --git a/src/libespeak-ng/dictionary.c b/src/libespeak-ng/dictionary.c
+index 9eaac672..5c9f6f74 100644
+--- a/src/libespeak-ng/dictionary.c
++++ b/src/libespeak-ng/dictionary.c
+@@ -20,6 +20,7 @@
+ #include "config.h"
+ 
+ #include <ctype.h>
++#include <limits.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -43,6 +44,8 @@
+ #include "synthesize.h"                    // for STRESS_IS_PRIMARY, phoneme...
+ #include "translate.h"                     // for Translator, utf8_in, LANGU...
+ 
++#include <espeak-ng/pico_data.h>
++
+ static int LookupFlags(Translator *tr, const char *word, unsigned int flags_out[2]);
+ static void DollarRule(char *word[], char *word_start, int consumed, int group_length, char word_buf[N_WORD_BYTES], Translator *tr, int command, int *failed, int *add_points);
+ 
+@@ -214,7 +217,8 @@ static bool InitGroups(Translator *tr, const char *end)
+ 
+ static void release_dictionary(Translator *tr)
+ {
+-	free(tr->data_dictlist);
++	free(tr->allocated_dictlist);
++	tr->allocated_dictlist = NULL;
+ 	tr->data_dictlist = NULL;
+ 	tr->data_dictrules = NULL;
+ 	tr->langopts.replace_chars = NULL;
+@@ -232,8 +236,7 @@ int LoadDictionary(Translator *tr, const char *name, int no_error)
+ 	char *end;
+ 	int *pw;
+ 	int length;
+-	FILE *f;
+-	int size;
++	int size = 0;
+ 	char fname[N_PATH_BUF];
+ 
+ 	if (dictionary_name != name)
+@@ -245,25 +248,39 @@ int LoadDictionary(Translator *tr, const char *name, int no_error)
+ 	// bytes 0-3:  offset to rules data
+ 	// bytes 4-7:  number of hash table entries
+ 	snprintf(fname, sizeof(fname), "%s%c%s_dict", path_home, PATHSEP, name);
+-	size = GetFileLength(fname);
+-
+ 	release_dictionary(tr);
+ 
+-	f = fopen(fname, "rb");
+-	if ((f == NULL) || (size <= 0)) {
+-		if (no_error == 0)
+-			fprintf(stderr, "Can't read dictionary file: '%s'\n", fname);
+-		if (f != NULL)
+-			fclose(f);
+-		return 1;
++#if PICO_ESPEAK_MAPPED_DATA
++	size_t mapped_length;
++	const void *mapped_data = pico_espeak_map_file(fname, &mapped_length);
++	if (mapped_data != NULL) {
++		if (mapped_length > INT_MAX || (uintptr_t)mapped_data % 4 != 0)
++			return 2;
++		// Dictionary lookup and rule indexes reference the data without modifying it.
++		tr->data_dictlist = (char *)mapped_data;
++		size = (int)mapped_length;
+ 	}
++#endif
+ 
+-	if ((tr->data_dictlist = malloc(size)) == NULL) {
++	if (tr->data_dictlist == NULL) {
++		size = GetFileLength(fname);
++		FILE *f = fopen(fname, "rb");
++		if ((f == NULL) || (size <= 0)) {
++			if (no_error == 0)
++				fprintf(stderr, "Can't read dictionary file: '%s'\n", fname);
++			if (f != NULL)
++				fclose(f);
++			return 1;
++		}
++
++		if ((tr->allocated_dictlist = malloc(size)) == NULL) {
++			fclose(f);
++			return 3;
++		}
++		tr->data_dictlist = tr->allocated_dictlist;
++		size = fread(tr->data_dictlist, 1, size, f);
+ 		fclose(f);
+-		return 3;
+ 	}
+-	size = fread(tr->data_dictlist, 1, size, f);
+-	fclose(f);
+ 
+ 	if ((size_t)size <= (N_HASH_DICT + sizeof(int)*2)) {
+ 		fprintf(stderr, "Empty _dict file: '%s\n", fname);
+@@ -1909,7 +1926,7 @@ static void MatchRule(Translator *tr, char *word[], char *word_start, int group_
+ 				{
+ 					int end_type;
+ 					// next 3 bytes are a (non-zero) ending type. 2 bytes of flags + suffix length
+-					end_type = (rule[0] << 16) + ((rule[1] & 0x7f) << 8) + (rule[2] & 0x7f);
++					end_type = (rule[0] * 65536) + ((rule[1] & 0x7f) << 8) + (rule[2] & 0x7f);
+ 
+ 					if ((tr->word_vowel_count == 0) && !(end_type & SUFX_P) && (tr->langopts.param[LOPT_SUFFIX] & 1))
+ 						failed = 1; // don't match a suffix rule if there are no previous syllables (needed for lang=tr).
+@@ -2470,7 +2487,7 @@ int TransposeAlphabet(Translator *tr, char *text, bool *packed)
+ 	if (all_alpha) {
+ 		// compress to 6 bits per character
+ 		int ix;
+-		int acc = 0;
++		unsigned int acc = 0;
+ 		int bits = 0;
+ 
+ 		p = buf;
+@@ -2478,7 +2495,7 @@ int TransposeAlphabet(Translator *tr, char *text, bool *packed)
+ 		while ((c = *p++) != 0) {
+ 			const short *pairs_list;
+ 			if ((pairs_list = tr->frequent_pairs) != NULL) {
+-				int c2 = c + (*p << 8);
++				int c2 = c + (*p * 256);
+ 				for (ix = 0; c2 >= pairs_list[ix]; ix++) {
+ 					if (c2 == pairs_list[ix]) {
+ 						// found an encoding for a 2-character pair
+diff --git a/src/libespeak-ng/intonation.c b/src/libespeak-ng/intonation.c
+index 08ef64d4..c9d30ec3 100644
+--- a/src/libespeak-ng/intonation.c
++++ b/src/libespeak-ng/intonation.c
+@@ -933,7 +933,7 @@ void CalcPitches(Translator *tr, int clause_type)
+ 	PHONEME_TAB *ph;
+ 	int ph_end = n_phoneme_list;
+ 
+-	SYLLABLE syllable_tab[N_PHONEME_LIST];
++	static SYLLABLE syllable_tab[N_PHONEME_LIST];
+ 	n_st = 0;
+ 	n_primary = 0;
+ 	for (ix = 0; ix < (n_phoneme_list-1); ix++) {
+diff --git a/src/libespeak-ng/klatt.c b/src/libespeak-ng/klatt.c
+index db389199..6dab7444 100644
+--- a/src/libespeak-ng/klatt.c
++++ b/src/libespeak-ng/klatt.c
+@@ -437,7 +437,7 @@ void KlattReset(int control)
+ 	int r_ix;
+ 
+ #if USE_SPEECHPLAYER
+-	KlattResetSP();
++	KlattFiniSP();
+ #endif
+ 
+ 	if (control == 2) {
+@@ -1081,10 +1081,6 @@ void KlattInit(void)
+ 
+ 	int ix;
+ 
+-#if USE_SPEECHPLAYER
+-	KlattInitSP();
+-#endif
+-
+ 	sample_count = 0;
+ 
+ 	kt_globals.synthesis_model = CASCADE_PARALLEL;
+diff --git a/src/libespeak-ng/langopts.c b/src/libespeak-ng/langopts.c
+index 6c873f74..fbab8fc5 100644
+--- a/src/libespeak-ng/langopts.c
++++ b/src/libespeak-ng/langopts.c
+@@ -39,6 +39,8 @@
+ #include "synthdata.h"                    // for n_tunes, tunes
+ #include "voice.h"                    // for ReadNumbers, Read8Numbers, ...
+ 
++#include <espeak-ng/pico_data.h>
++
+ static int CheckTranslator(Translator *tr, const MNEM_TAB *keyword_tab, int key);
+ static int LookupTune(const char *name);
+ 
+diff --git a/src/libespeak-ng/numbers.c b/src/libespeak-ng/numbers.c
+index 46d57a31..daeee0bc 100644
+--- a/src/libespeak-ng/numbers.c
++++ b/src/libespeak-ng/numbers.c
+@@ -1256,7 +1256,19 @@ static int LookupNum2(Translator *tr, int value, int thousandplex, const int con
+ 	return used_and;
+ }
+ 
+-static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_null, int thousandplex, int control)
++typedef struct {
++	char string[14];
++	char buf1[100];
++	char buf2[100];
++	char ph_100[N_PHONEME_BYTES];
++	char ph_10T[N_PHONEME_BYTES];
++	char ph_digits[50];
++	char ph_thousands[211];
++	char ph_hundred_and[12];
++	char ph_thousand_and[12];
++} NumberGroupBuffers;
++
++static int LookupNum3WithBuffers(Translator *tr, int value, char *ph_out, bool suppress_null, int thousandplex, int control, NumberGroupBuffers *scratch)
+ {
+ 	// Translate a 3 digit number
+ 	//  control  bit 0,  previous thousands
+@@ -1275,15 +1287,15 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 	int tplex;
+ 	bool say_zero_hundred = false;
+ 	bool say_one_hundred;
+-	char string[14]; // for looking up entries in **_list
+-	char buf1[100];
+-	char buf2[100];
+-	char ph_100[N_PHONEME_BYTES];
+-	char ph_10T[N_PHONEME_BYTES];
+-	char ph_digits[50];
+-	char ph_thousands[211];
+-	char ph_hundred_and[12];
+-	char ph_thousand_and[12];
++	char *string = scratch->string; // for looking up entries in **_list
++	char *buf1 = scratch->buf1;
++	char *buf2 = scratch->buf2;
++	char *ph_100 = scratch->ph_100;
++	char *ph_10T = scratch->ph_10T;
++	char *ph_digits = scratch->ph_digits;
++	char *ph_thousands = scratch->ph_thousands;
++	char *ph_hundred_and = scratch->ph_hundred_and;
++	char *ph_thousand_and = scratch->ph_thousand_and;
+ 
+ 	ordinal = control & 0x22;
+ 	hundreds = value / 100;
+@@ -1300,15 +1312,15 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 		found = 0;
+ 		if (ordinal && (tensunits == 0)) {
+ 			// ordinal number, with no tens or units
+-			found = Lookup(tr, "_0Co", ph_100, sizeof(ph_100));
++			found = Lookup(tr, "_0Co", ph_100, sizeof(scratch->ph_100));
+ 		}
+ 		if (found == 0) {
+ 			if (tensunits == 0) {
+ 				// special form for exact hundreds?
+-				found = Lookup(tr, "_0C0", ph_100, sizeof(ph_100));
++				found = Lookup(tr, "_0C0", ph_100, sizeof(scratch->ph_100));
+ 			}
+ 			if (!found)
+-				Lookup(tr, "_0C", ph_100, sizeof(ph_100));
++				Lookup(tr, "_0C", ph_100, sizeof(scratch->ph_100));
+ 		}
+ 
+ 		if (((tr->langopts.numbers & NUM_1900) != 0) && (hundreds == 19)) {
+@@ -1349,7 +1361,7 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 
+ 		if ((hundreds > 0) || say_zero_hundred) {
+ 			if ((tr->langopts.numbers & NUM_AND_HUNDRED) && ((control & 1) || (ph_thousands[0] != 0)))
+-				Lookup(tr, "_0and", ph_thousand_and, sizeof(ph_thousand_and));
++				Lookup(tr, "_0and", ph_thousand_and, sizeof(scratch->ph_thousand_and));
+ 
+ 			suppress_null = true;
+ 
+@@ -1358,7 +1370,7 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 			    && ((tensunits == 0) || (tr->langopts.numbers2 & NUM2_MULTIPLE_ORDINAL))) {
+ 				// ordinal number
+ 				sprintf(string, "_%dCo", hundreds);
+-				found = Lookup(tr, string, ph_digits, sizeof(ph_digits));
++				found = Lookup(tr, string, ph_digits, sizeof(scratch->ph_digits));
+ 
+ 				if ((tr->langopts.numbers2 & NUM2_MULTIPLE_ORDINAL) && (tensunits > 0)) {
+ 					// Use ordinal form of hundreds, as well as for tens and units
+@@ -1368,7 +1380,7 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 			}
+ 
+ 			if ((hundreds == 0) && say_zero_hundred)
+-				Lookup(tr, "_0", ph_digits, sizeof(ph_digits));
++				Lookup(tr, "_0", ph_digits, sizeof(scratch->ph_digits));
+ 			else {
+ 				if ((hundreds == 1) && (tr->langopts.numbers2 & NUM2_OMIT_1_HUNDRED_ONLY) && ((control & 1) == 0)) {
+ 					// only look for special 100 if there are previous thousands
+@@ -1376,12 +1388,12 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 					if ((!found) && (tensunits == 0)) {
+ 						// is there a special pronunciation for exactly n00 ?
+ 						sprintf(string, "_%dC0", hundreds);
+-						found = Lookup(tr, string, ph_digits, sizeof(ph_digits));
++						found = Lookup(tr, string, ph_digits, sizeof(scratch->ph_digits));
+ 					}
+ 
+ 					if (!found) {
+ 						sprintf(string, "_%dC", hundreds);
+-						found = Lookup(tr, string, ph_digits, sizeof(ph_digits));  // is there a specific pronunciation for n-hundred ?
++						found = Lookup(tr, string, ph_digits, sizeof(scratch->ph_digits));  // is there a specific pronunciation for n-hundred ?
+ 					}
+ 				}
+ 
+@@ -1400,7 +1412,7 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 			}
+ 		}
+ 
+-		snprintf(buf1, sizeof(buf1), "%s%s%s%s", ph_thousands, ph_thousand_and, ph_digits, ph_100);
++		snprintf(buf1, sizeof(scratch->buf1), "%s%s%s%s", ph_thousands, ph_thousand_and, ph_digits, ph_100);
+ 	}
+ 
+ 	ph_hundred_and[0] = 0;
+@@ -1410,10 +1422,10 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 		} else {
+ 			if ((value > 100) || ((control & 1) && (thousandplex == 0))) {
+ 				if ((tr->langopts.numbers & NUM_HUNDRED_AND) || ((tr->langopts.numbers & NUM_HUNDRED_AND_DIGIT) && (tensunits < 10)))
+-					Lookup(tr, "_0and", ph_hundred_and, sizeof(ph_hundred_and));
++					Lookup(tr, "_0and", ph_hundred_and, sizeof(scratch->ph_hundred_and));
+ 			}
+ 			if ((tr->langopts.numbers & NUM_THOUSAND_AND) && (hundreds == 0) && ((control & 1) || (ph_thousands[0] != 0)))
+-				Lookup(tr, "_0and", ph_hundred_and, sizeof(ph_hundred_and));
++				Lookup(tr, "_0and", ph_hundred_and, sizeof(scratch->ph_hundred_and));
+ 		}
+ 	}
+ 
+@@ -1460,6 +1472,21 @@ static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_nul
+ 	return 0;
+ }
+ 
++static int LookupNum3(Translator *tr, int value, char *ph_out, bool suppress_null, int thousandplex, int control)
++{
++	// Pronouncing a number can trigger another dictionary translation.
++	enum { MAX_ACTIVE_NUMBERS = 3 };
++	static NumberGroupBuffers buffers[MAX_ACTIVE_NUMBERS];
++	static unsigned active;
++	if (active == MAX_ACTIVE_NUMBERS) {
++		ph_out[0] = 0;
++		return 0;
++	}
++	int result = LookupNum3WithBuffers(tr, value, ph_out, suppress_null, thousandplex, control, &buffers[active++]);
++	--active;
++	return result;
++}
++
+ static bool LookupDecimal(Translator *tr, const char *digits, int count, char *ph_out, size_t size)
+ {
+ 	// Translate the numerator in groups without overflowing an integer.
+@@ -1521,7 +1548,18 @@ static bool CheckThousandsGroup(char *word, int group_len)
+ 	return true;
+ }
+ 
+-static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_out_end, unsigned int *flags, WORD_TAB *wtab, int wtab_remaining, int control)
++typedef struct {
++	char string[32];
++	char buf1[100];
++	char ph_append[50];
++	char ph_buf[200];
++	char ph_buf2[50];
++	char ph_zeros[50];
++	char suffix[30];
++	char buf_digit_lookup[50];
++} NumberTranslationBuffers;
++
++static int TranslateNumber_1WithBuffers(Translator *tr, char *word, char *ph_out, char *ph_out_end, unsigned int *flags, WORD_TAB *wtab, int wtab_remaining, int control, NumberTranslationBuffers *scratch)
+ {
+ 	//  Number translation with various options
+ 	// the "word" may be up to 4 digits
+@@ -1549,14 +1587,14 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 	int group_len;
+ 	int len;
+ 	char *p;
+-	char string[32]; // for looking up entries in **_list
+-	char buf1[100];
+-	char ph_append[50];
+-	char ph_buf[200];
+-	char ph_buf2[50];
+-	char ph_zeros[50];
+-	char suffix[30]; // string[] must be long enough for sizeof(suffix)+2
+-	char buf_digit_lookup[50];
++	char *string = scratch->string; // for looking up entries in **_list
++	char *buf1 = scratch->buf1;
++	char *ph_append = scratch->ph_append;
++	char *ph_buf = scratch->ph_buf;
++	char *ph_buf2 = scratch->ph_buf2;
++	char *ph_zeros = scratch->ph_zeros;
++	char *suffix = scratch->suffix; // string[] must be long enough for sizeof(scratch->suffix)+2
++	char *buf_digit_lookup = scratch->buf_digit_lookup;
+ 	char *ph_cur;
+ 
+ 	static const char str_pause[2] = { phonPAUSE_NOLINK, 0 };
+@@ -1614,7 +1652,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 			*p++ = '-';
+ 			ix++;
+ 		}
+-		while ((word[ix] != 0) && (word[ix] != ' ') && (ix < (int)(sizeof(suffix)-1)))
++		while ((word[ix] != 0) && (word[ix] != ' ') && (ix < (int)(sizeof(scratch->suffix)-1)))
+ 			*p++ = word[ix++];
+ 		*p = 0;
+ 
+@@ -1631,7 +1669,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 					ordinal = 2;
+ 					flags[0] |= FLAG_SKIPWORDS;
+ 					skipwords = 1;
+-					snprintf(string, sizeof(string), "_x#%s", suffix);
++					snprintf(string, sizeof(scratch->string), "_x#%s", suffix);
+ 					Lookup(tr, string, ph_ordinal2x, sizeof(ph_ordinal2x)); // is there an alternate pronunciation?
+ 				}
+ 			}
+@@ -1655,7 +1693,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 
+ 			// speak leading zeros
+ 			for (ix = 0; (word[ix] == '0') && (ix < (n_digits-1)); ix++)
+-				Lookup(tr, "_0", &ph_zeros[strlen(ph_zeros)], sizeof(ph_zeros) - strlen(ph_zeros));
++				Lookup(tr, "_0", &ph_zeros[strlen(ph_zeros)], sizeof(scratch->ph_zeros) - strlen(ph_zeros));
+ 		}
+ 	}
+ 
+@@ -1699,7 +1737,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 
+ 	if ((word[n_digits] == tr->langopts.decimal_sep) && IsDigit09(word[n_digits+1])) {
+ 		// this "word" ends with a decimal point
+-		Lookup(tr, "_dpt", ph_append, sizeof(ph_append));
++		Lookup(tr, "_dpt", ph_append, sizeof(scratch->ph_append));
+ 		decimal_point = 0x100;
+ 	} else if (suppress_null == false) {
+ 		if (thousands_inc > 0) {
+@@ -1714,14 +1752,14 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 	} else if (speak_missing_thousands == 1) {
+ 		// speak this thousandplex if there was no word for the previous thousandplex
+ 		sprintf(string, "_0M%d", thousandplex+1);
+-		if (Lookup(tr, string, buf1, sizeof(buf1)) == 0) {
++		if (Lookup(tr, string, buf1, sizeof(scratch->buf1)) == 0) {
+ 			sprintf(string, "_0M%d", thousandplex);
+-			Lookup(tr, string, ph_append, sizeof(ph_append));
++			Lookup(tr, string, ph_append, sizeof(scratch->ph_append));
+ 		}
+ 	}
+ 
+ 	if ((ph_append[0] == 0) && (word[n_digits] == '.') && (thousandplex == 0))
+-		Lookup(tr, "_.", ph_append, sizeof(ph_append));
++		Lookup(tr, "_.", ph_append, sizeof(scratch->ph_append));
+ 
+ 	if (thousandplex == 0) {
+ 		char *p2;
+@@ -1789,7 +1827,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 		case NUM_DFRACTION_2:
+ 			// French/Polish decimal fraction
+ 			while (word[n_digits] == '0') {
+-				Lookup(tr, "_0", buf1, sizeof(buf1));
++				Lookup(tr, "_0", buf1, sizeof(scratch->buf1));
+ 				len = strlen(buf1);
+ 				if (ph_cur + len + 1 > ph_out_end)
+ 					goto stop;
+@@ -1818,20 +1856,20 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 			if (decimal_count <= 5)
+ 				LookupNum3(tr, atoi(&word[n_digits]), ph_buf, false, 0,
+ 				           (tr->langopts.numbers2 & NUM2_FRACTION_FEMININE) ? 0x400 : 0);
+-			else if (!LookupDecimal(tr, &word[n_digits], decimal_count, ph_buf, sizeof(ph_buf)))
++			else if (!LookupDecimal(tr, &word[n_digits], decimal_count, ph_buf, sizeof(scratch->ph_buf)))
+ 				break; // revert to speaking single digits
+ 			if ((word[n_digits] == '0') || (decimal_mode != NUM_DFRACTION_1)) {
+ 				// decimal part has leading zeros, so add a "hundredths" or "thousandths" suffix
+ 				if ((tr->langopts.numbers2 & NUM2_FRACTION_FEMININE)
+ 				    && ((value % 10) == 1) && ((value % 100) != 11)) {
+ 					sprintf(string, "_0Z%ds", decimal_count);
+-					Lookup(tr, string, buf1, sizeof(buf1));
++					Lookup(tr, string, buf1, sizeof(scratch->buf1));
+ 				} else
+ 					buf1[0] = 0;
+ 
+ 				if (buf1[0] == 0) {
+ 					sprintf(string, "_0Z%d", decimal_count);
+-					Lookup(tr, string, buf1, sizeof(buf1));
++					Lookup(tr, string, buf1, sizeof(scratch->buf1));
+ 				}
+ 				if (buf1[0] == 0)
+ 					break; // revert to speaking single digits
+@@ -1843,7 +1881,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 					strcpy(ph_cur, buf1);
+ 					ph_cur += len;
+ 				} else {
+-					if (strlen(ph_buf) + strlen(buf1) + 1 > sizeof(ph_buf))
++					if (strlen(ph_buf) + strlen(buf1) + 1 > sizeof(scratch->ph_buf))
+ 						break; // revert to speaking single digits
+ 					strcat(ph_buf, buf1);
+ 				}
+@@ -1874,7 +1912,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 			// alternative form of decimal fraction digits, except the final digit
+ 			while (decimal_count-- > 1) {
+ 				sprintf(string, "_%cd", word[n_digits]);
+-				if (Lookup(tr, string, buf1, sizeof(buf1)) == 0)
++				if (Lookup(tr, string, buf1, sizeof(scratch->buf1)) == 0)
+ 					break;
+ 				n_digits++;
+ 				len = strlen(buf1);
+@@ -1899,7 +1937,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 		}
+ 
+ 		// something after the decimal part ?
+-		if (!fraction_suffix && Lookup(tr, "_dpt2", buf1, sizeof(buf1))) {
++		if (!fraction_suffix && Lookup(tr, "_dpt2", buf1, sizeof(scratch->buf1))) {
+ 			len = strlen(buf1);
+ 			if (ph_cur + len + 1 > ph_out_end)
+ 				goto stop;
+@@ -1908,7 +1946,7 @@ static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_
+ 		}
+ 
+ 		if ((c == tr->langopts.decimal_sep) && IsDigit09(word[n_digits+1])) {
+-			Lookup(tr, "_dpt", buf1, sizeof(buf1));
++			Lookup(tr, "_dpt", buf1, sizeof(scratch->buf1));
+ 			len = strlen(buf1);
+ 			if (ph_cur + len + 1 > ph_out_end)
+ 				goto stop;
+@@ -1944,6 +1982,22 @@ stop:
+ 	return 1;
+ }
+ 
++static int TranslateNumber_1(Translator *tr, char *word, char *ph_out, char *ph_out_end, unsigned int *flags, WORD_TAB *wtab, int wtab_remaining, int control)
++{
++	// Pronouncing a number can trigger another dictionary translation.
++	enum { MAX_ACTIVE_NUMBERS = 3 };
++	static NumberTranslationBuffers buffers[MAX_ACTIVE_NUMBERS];
++	static unsigned active;
++	if (active == MAX_ACTIVE_NUMBERS) {
++		ph_out[0] = 0;
++		*flags = 0;
++		return 0;
++	}
++	int result = TranslateNumber_1WithBuffers(tr, word, ph_out, ph_out_end, flags, wtab, wtab_remaining, control, &buffers[active++]);
++	--active;
++	return result;
++}
++
+ int TranslateNumber(Translator *tr, char *word1, char *ph_out, char *ph_out_end, unsigned int *flags, WORD_TAB *wtab, int wtab_remaining, int control)
+ {
+ 	if ((option_sayas == SAYAS_DIGITS1) || (wtab[0].flags & FLAG_INDIVIDUAL_DIGITS))
+diff --git a/src/libespeak-ng/phonemelist.c b/src/libespeak-ng/phonemelist.c
+index 7ccbcbe6..ec2089c4 100644
+--- a/src/libespeak-ng/phonemelist.c
++++ b/src/libespeak-ng/phonemelist.c
+@@ -152,7 +152,8 @@ void MakePhonemeList(Translator *tr, int post_pause, bool start_sentence)
+ 	int n_ph_list3;
+ 	PHONEME_LIST *plist3;
+ 	PHONEME_LIST *plist3_inserted = NULL;
+-	PHONEME_LIST ph_list3[N_PHONEME_LIST];
++	// Synthesis is single-threaded. Keep the 36 KB temporary list off the stack.
++	static PHONEME_LIST ph_list3[N_PHONEME_LIST];
+ 
+ 	PHONEME_LIST2 *plist2;
+ 	WORD_PH_DATA worddata;
+diff --git a/src/libespeak-ng/readclause.c b/src/libespeak-ng/readclause.c
+index abb687ca..4b5522e0 100644
+--- a/src/libespeak-ng/readclause.c
++++ b/src/libespeak-ng/readclause.c
+@@ -282,9 +282,9 @@ static int AnnouncePunctuation(Translator *tr, int c1, int *c2_ptr, char *output
+ 	int c2;
+ 	int len;
+ 	int bufix1;
+-	char buf[3 * (N_CHARNAME_BUF + 1) + 40]; // up to three names and two speed commands
+-	char ph_buf[N_CHARNAME_BUF];
+-	char cn_buf[N_CHARNAME_BUF];
++	static char buf[3 * (N_CHARNAME_BUF + 1) + 40]; // up to three names and two speed commands
++	static char ph_buf[N_CHARNAME_BUF];
++	static char text_buf[N_CHARNAME_BUF];
+ 
+ 	c2 = *c2_ptr;
+ 	buf[0] = 0;
+@@ -299,7 +299,7 @@ static int AnnouncePunctuation(Translator *tr, int c1, int *c2_ptr, char *output
+ 				punctname = ph_buf; // use word for 'period' instead of 'dot'
+ 		}
+ 		if (punctname == NULL)
+-			punctname = LookupCharName(cn_buf, tr, c1, false);
++			punctname = LookupCharName(text_buf, tr, c1, false);
+ 
+ 		if (punctname == NULL)
+ 			return -1;
+@@ -322,7 +322,7 @@ static int AnnouncePunctuation(Translator *tr, int c1, int *c2_ptr, char *output
+ 				if (embedded_value[EMBED_S] < 300)
+ 					sprintf(buf, "\001+10S"); // Speak punctuation name faster, unless we are already speaking fast.  It would upset Sonic SpeedUp
+ 
+-				char buf2[N_CHARNAME_BUF + 2];
++				static char buf2[N_CHARNAME_BUF + 2];
+ 				while (punct_count-- > 0) {
+ 					sprintf(buf2, " %s", punctname);
+ 					strcat(buf, buf2);
+@@ -518,7 +518,8 @@ int ReadClause(Translator *tr, char *buf, short *charix, int *charix_top, int n_
+ 	bool stressed_word = false;
+ 	int end_clause_after_tag = 0;
+ 	int end_clause_index = 0;
+-	wchar_t xml_buf[N_XML_BUF+1];
++	static wchar_t xml_buf[N_XML_BUF+1];
++	static char text_buf[N_CHARNAME_BUF];
+ 
+ 	#define N_XML_BUF2 20
+ 	char xml_buf2[N_XML_BUF2+2]; // for &<name> and &<number> sequences
+@@ -596,7 +597,12 @@ int ReadClause(Translator *tr, char *buf, short *charix, int *charix_top, int n_
+ 				} else {
+ 					c2 = GetC();
+ 				}
+-				swprintf(ungot_string, N_XML_BUF2+4, L"%s%lc%lc", &xml_buf2[0], (wint_t)c1, (wint_t)c2);
++				// Entity names contain only ASCII characters.
++				for (int i = 0; i < n_xml_buf; ++i)
++					ungot_string[i] = xml_buf2[i];
++				ungot_string[n_xml_buf] = c1;
++				ungot_string[n_xml_buf + 1] = c2;
++				ungot_string[n_xml_buf + 2] = 0;
+ 
+ 				int found = -1;
+ 				if (c1 == ';') {
+@@ -745,7 +751,6 @@ int ReadClause(Translator *tr, char *buf, short *charix, int *charix_top, int n_
+ 			tr->clause_upper_count++;
+ 
+ 			if ((option_capitals == 2) && (sayas_mode == 0) && !iswupper(cprev)) {
+-				char text_buf[N_CHARNAME_BUF];
+ 				if (LookupSpecial(tr, "_cap", text_buf, sizeof(text_buf)) != NULL) {
+ 					j = strlen(text_buf);
+ 					if ((ix + j) < n_buf) {
+@@ -863,8 +868,7 @@ int ReadClause(Translator *tr, char *buf, short *charix, int *charix_top, int n_
+ 				char *p2;
+ 
+ 				p2 = &buf[ix];
+-				char cn_buf[N_CHARNAME_BUF];
+-				const char *name = LookupCharName(cn_buf, tr, c1, true);
++				const char *name = LookupCharName(text_buf, tr, c1, true);
+ 				p2[0] = 0;
+ 				if (ix + (int)strlen(name) < n_buf - 4) // only if it fits in the clause
+ 					snprintf(p2, n_buf - ix, "%s", name);
+diff --git a/src/libespeak-ng/sPlayer.c b/src/libespeak-ng/sPlayer.c
+index 92b28a95..df5385c3 100644
+--- a/src/libespeak-ng/sPlayer.c
++++ b/src/libespeak-ng/sPlayer.c
+@@ -1,3 +1,5 @@
++#include "config.h"
++
+ #include <espeak-ng/espeak_ng.h>
+ #include <espeak-ng/speak_lib.h>
+ #include "sPlayer.h"
+@@ -93,22 +95,15 @@ static void fillSpeechPlayerFrame(WGEN_DATA *wdata, voice_t *wvoice, frame_t * e
+ 	spFrame->endVoicePitch=spFrame->voicePitch;
+ }
+ 
+-void KlattInitSP(void) {
+-	speechPlayerHandle=speechPlayer_initialize(22050);
+-}
+-
+ void KlattFiniSP(void) {
+ 	if (speechPlayerHandle)
+ 		speechPlayer_terminate(speechPlayerHandle);
+ 	speechPlayerHandle = NULL;
+ }
+ 
+-void KlattResetSP(void) {
+-	KlattFiniSP();
+-	KlattInitSP();
+-}
+-
+ int Wavegen_KlattSP(WGEN_DATA *wdata, voice_t *wvoice, int length, int resume, frame_t *fr1, frame_t *fr2){
++	if (!speechPlayerHandle)
++		speechPlayerHandle = speechPlayer_initialize(22050);
+ 	if(!resume) {
+ 		speechPlayer_frame_t spFrame1={0};
+ 		fillSpeechPlayerFrame(wdata, wvoice, fr1,&spFrame1);
+diff --git a/src/libespeak-ng/sPlayer.h b/src/libespeak-ng/sPlayer.h
+index 04bcfc72..68b1d7dd 100644
+--- a/src/libespeak-ng/sPlayer.h
++++ b/src/libespeak-ng/sPlayer.h
+@@ -3,14 +3,12 @@
+ 
+ #include "synthesize.h"
+ #include "voice.h"
+-#include <speechPlayer.h>
++#include "../speechPlayer/include/speechPlayer.h"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-	void KlattInitSP(void);
+-	void KlattResetSP(void);
+ 	void KlattFiniSP(void);
+ 	int Wavegen_KlattSP(WGEN_DATA *wdata, voice_t *wvoice, int length, int resume, frame_t *fr1, frame_t *fr2);
+ 
+diff --git a/src/libespeak-ng/setlengths.c b/src/libespeak-ng/setlengths.c
+index f154bd2d..600eb83c 100644
+--- a/src/libespeak-ng/setlengths.c
++++ b/src/libespeak-ng/setlengths.c
+@@ -328,6 +328,12 @@ espeak_ng_STATUS SetParameter(int parameter, int value, int relative)
+ 		if (new_value > 99) new_value = 99;
+ 		embedded_value[EMBED_R] = new_value;
+ 		break;
++	case espeakPUNCTUATION:
++		option_punctuation = new_value;
++		break;
++	case espeakCAPITALS:
++		option_capitals = new_value;
++		break;
+ 	case espeakLINELENGTH:
+ 		option_linelength = new_value;
+ 		break;
+diff --git a/src/libespeak-ng/soundicon.c b/src/libespeak-ng/soundicon.c
+index 775864c5..393b22c4 100644
+--- a/src/libespeak-ng/soundicon.c
++++ b/src/libespeak-ng/soundicon.c
+@@ -41,6 +41,8 @@
+ #include "speech.h"                   // for path_home, PATHSEP
+ #include "synthesize.h"                   // for samplerate
+ 
++#include <espeak-ng/pico_data.h>
++
+ int n_soundicon_tab = 0;
+ SOUND_ICON soundicon_tab[N_SOUNDICON_TAB];
+ 
+diff --git a/src/libespeak-ng/spect.c b/src/libespeak-ng/spect.c
+index 0747a8ac..8f81e44e 100644
+--- a/src/libespeak-ng/spect.c
++++ b/src/libespeak-ng/spect.c
+@@ -41,6 +41,8 @@
+ #include "synthesize.h"                // for KLATT_AV, KLATT_Kopen, N_KLATTP2
+ #include "voice.h"                     // for N_PEAKS
+ 
++#include <espeak-ng/pico_data.h>
++
+ static const int default_freq[N_PEAKS] =
+ { 200, 500, 1200, 3000, 3500, 4000, 6900, 7800, 9000 };
+ static const int default_width[N_PEAKS] =
+diff --git a/src/libespeak-ng/speech.c b/src/libespeak-ng/speech.c
+index 236a7b8f..6356e688 100644
+--- a/src/libespeak-ng/speech.c
++++ b/src/libespeak-ng/speech.c
+@@ -392,8 +392,10 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_Initialize(espeak_ng_ERROR_CONTEXT *con
+ 	}
+ 
+ 	espeak_ng_STATUS result = LoadPhData(&srate, context);
+-	if (result != ENS_OK)
++	if (result != ENS_OK) {
++		FreePhData();
+ 		return result;
++	}
+ 
+ 	WavegenInit(srate, 0);
+ 	LoadConfig();
+@@ -435,6 +437,16 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetPhonemeEvents(int enable, int ipa) {
+ 	return ENS_OK;
+ }
+ 
++#if !USE_MBROLA
++ESPEAK_NG_API espeak_ng_STATUS espeak_ng_CompileMbrolaVoice(const char *path, FILE *log, espeak_ng_ERROR_CONTEXT *context)
++{
++	(void)path;
++	(void)log;
++	(void)context;
++	return ENS_NOT_SUPPORTED;
++}
++#endif
++
+ ESPEAK_NG_API int espeak_ng_GetSampleRate(void)
+ {
+ 	return samplerate;
+diff --git a/src/libespeak-ng/synthdata.c b/src/libespeak-ng/synthdata.c
+index b2b09436..700d42c2 100644
+--- a/src/libespeak-ng/synthdata.c
++++ b/src/libespeak-ng/synthdata.c
+@@ -21,6 +21,7 @@
+ 
+ #include <ctype.h>
+ #include <errno.h>
++#include <limits.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+@@ -42,6 +43,8 @@
+ #include "translate.h"                // for Translator, LANGUAGE_OPTIONS
+ #include "voice.h"                    // for ReadTonePoints, tone_points, voice
+ 
++#include <espeak-ng/pico_data.h>
++
+ int n_tunes = 0;
+ TUNE *tunes = NULL;
+ 
+@@ -57,13 +60,19 @@ static char *phondata_ptr = NULL;
+ unsigned char *wavefile_data = NULL;
+ static unsigned char *phoneme_tab_data = NULL;
+ 
++// Only heap-backed files have an allocation to release.
++static void *allocated_phoneme_tab;
++static void *allocated_phoneme_index;
++static void *allocated_phondata;
++static void *allocated_tunes;
++
+ static int n_phoneme_tables;
+ PHONEME_TAB_LIST phoneme_tab_list[N_PHONEME_TABS];
+ int phoneme_tab_number = 0;
+ 
+ int seq_len_adjust;
+ 
+-static espeak_ng_STATUS ReadPhFile(void **ptr, const char *fname, int *size, espeak_ng_ERROR_CONTEXT *context)
++static espeak_ng_STATUS ReadPhFile(void **ptr, void **allocation, const char *fname, int *size, espeak_ng_ERROR_CONTEXT *context)
+ {
+ 	if (!ptr) return EINVAL;
+ 
+@@ -72,6 +81,24 @@ static espeak_ng_STATUS ReadPhFile(void **ptr, const char *fname, int *size, esp
+ 	char buf[N_PATH_BUF];
+ 
+ 	snprintf(buf, sizeof(buf), "%s%c%s", path_home, PATHSEP, fname);
++	free(*allocation);
++	*allocation = NULL;
++	*ptr = NULL;
++
++#if PICO_ESPEAK_MAPPED_DATA
++	size_t mapped_length;
++	const void *mapped_data = pico_espeak_map_file(buf, &mapped_length);
++	if (mapped_data != NULL) {
++		if (mapped_length == 0 || mapped_length > INT_MAX || (uintptr_t)mapped_data % 4 != 0)
++			return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, buf);
++		// The synthesis tables and samples are read only. Modified frames are copied to RAM.
++		*ptr = (void *)mapped_data;
++		if (size != NULL)
++			*size = (int)mapped_length;
++		return ENS_OK;
++	}
++#endif
++
+ 	length = GetFileLength(buf);
+ 	if (length < 0) // length == -errno
+ 		return create_file_error_context(context, -length, buf);
+@@ -79,30 +106,26 @@ static espeak_ng_STATUS ReadPhFile(void **ptr, const char *fname, int *size, esp
+ 	if ((f_in = fopen(buf, "rb")) == NULL)
+ 		return create_file_error_context(context, errno, buf);
+ 
+-	if (*ptr != NULL) {
+-		free(*ptr);
+-		*ptr = NULL;
+-	}
+-
+ 	if (length == 0) {
+ 		// Callers dereference *data without a NULL check, so an empty file is an error.
+ 		fclose(f_in);
+ 		return create_file_error_context(context, ENS_UNEXPECTED_EOF, buf);
+ 	}
+ 
+-	if ((*ptr = malloc(length)) == NULL) {
++	void *data = malloc(length);
++	if (data == NULL) {
+ 		fclose(f_in);
+ 		return ENOMEM;
+ 	}
+-	if (fread(*ptr, 1, length, f_in) != (size_t)length) {
+-		int error = errno;
++	if (fread(data, 1, length, f_in) != (size_t)length) {
++		int error = ferror(f_in) ? EIO : ENS_UNEXPECTED_EOF;
+ 		fclose(f_in);
+-		free(*ptr);
+-		*ptr = NULL;
++		free(data);
+ 		return create_file_error_context(context, error, buf);
+ 	}
+ 
+ 	fclose(f_in);
++	*ptr = *allocation = data;
+ 	if (size != NULL)
+ 		*size = length;
+ 	return ENS_OK;
+@@ -115,19 +138,22 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
+ 	int length = 0;
+ 	int phontab_size = 0;
+ 	int phondata_size = 0;
++	int phonindex_size = 0;
+ 	int rate;
+ 	unsigned char *p;
+ 	unsigned char *p_end;
+ 
+ 	espeak_ng_STATUS status;
+-	if ((status = ReadPhFile((void **)&phoneme_tab_data, "phontab", &phontab_size, context)) != ENS_OK)
++	if ((status = ReadPhFile((void **)&phoneme_tab_data, &allocated_phoneme_tab, "phontab", &phontab_size, context)) != ENS_OK)
+ 		return status;
+-	if ((status = ReadPhFile((void **)&phoneme_index, "phonindex", NULL, context)) != ENS_OK)
++	if ((status = ReadPhFile((void **)&phoneme_index, &allocated_phoneme_index, "phonindex", &phonindex_size, context)) != ENS_OK)
+ 		return status;
+-	if ((status = ReadPhFile((void **)&phondata_ptr, "phondata", &phondata_size, context)) != ENS_OK)
++	if ((status = ReadPhFile((void **)&phondata_ptr, &allocated_phondata, "phondata", &phondata_size, context)) != ENS_OK)
+ 		return status;
+-	if ((status = ReadPhFile((void **)&tunes, "intonations", &length, context)) != ENS_OK)
++	if ((status = ReadPhFile((void **)&tunes, &allocated_tunes, "intonations", &length, context)) != ENS_OK)
+ 		return status;
++	if ((phonindex_size < sizeof(*phoneme_index)) || (length < sizeof(TUNE)))
++		return ENS_UNSUPPORTED_PHON_FORMAT;
+ 	wavefile_data = (unsigned char *)phondata_ptr;
+ 	n_tunes = length / sizeof(TUNE);
+ 
+@@ -143,6 +169,8 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
+ 
+ 	if (version != version_phdata)
+ 		return create_version_mismatch_error_context(context, path_home, version, version_phdata);
++	if (rate <= 0)
++		return ENS_UNSUPPORTED_PHON_FORMAT;
+ 
+ 	// set up phoneme tables
+ 	if ((phoneme_tab_data == NULL) || (phontab_size < 4))
+@@ -156,10 +184,10 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
+ 
+ 	for (ix = 0; ix < n_phoneme_tables; ix++) {
+ 		int n_phonemes;
+-		if (p + 4 + N_PHONEME_TAB_NAME > p_end)
++		if (p_end - p < 4 + N_PHONEME_TAB_NAME)
+ 			return ENS_UNSUPPORTED_PHON_FORMAT;
+ 		n_phonemes = p[0];
+-		if (p + 4 + N_PHONEME_TAB_NAME + (n_phonemes * sizeof(PHONEME_TAB)) > p_end)
++		if (p[1] > ix || (size_t)(p_end - p - 4 - N_PHONEME_TAB_NAME) < n_phonemes * sizeof(PHONEME_TAB))
+ 			return ENS_UNSUPPORTED_PHON_FORMAT;
+ 		phoneme_tab_list[ix].n_phonemes = p[0];
+ 		phoneme_tab_list[ix].includes = p[1];
+@@ -180,10 +208,15 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
+ 
+ void FreePhData(void)
+ {
+-	free(phoneme_tab_data);
+-	free(phoneme_index);
+-	free(phondata_ptr);
+-	free(tunes);
++	free(allocated_phoneme_tab);
++	free(allocated_phoneme_index);
++	free(allocated_phondata);
++	free(allocated_tunes);
++	allocated_phoneme_tab = NULL;
++	allocated_phoneme_index = NULL;
++	allocated_phondata = NULL;
++	allocated_tunes = NULL;
++	wavefile_data = NULL;
+ 	phoneme_tab_data = NULL;
+ 	phoneme_index = NULL;
+ 	phondata_ptr = NULL;
+diff --git a/src/libespeak-ng/synthesize.h b/src/libespeak-ng/synthesize.h
+index 975820b9..3a414291 100644
+--- a/src/libespeak-ng/synthesize.h
++++ b/src/libespeak-ng/synthesize.h
+@@ -32,7 +32,12 @@ extern "C"
+ 
+ #define espeakINITIALIZE_PHONEME_IPA 0x0002 // move this to speak_lib.h, after eSpeak version 1.46.02
+ 
+-#define N_PHONEME_LIST 1000 // enough for source[N_TR_SOURCE] full of text, else it will truncate
++// Leave room for RP2040 Wi-Fi and application state. Keep this paired with N_TR_SOURCE.
++#if PICO_ESPEAK_MAPPED_DATA
++#define N_PHONEME_LIST 512
++#else
++#define N_PHONEME_LIST 1000
++#endif
+ 
+ #define N_SEQ_FRAMES  25 // max frames in a spectrum sequence (real max is ablut 8)
+ #define STEPSIZE      64 // 2.9mS at 22 kHz sample rate
+diff --git a/src/libespeak-ng/tr_languages.c b/src/libespeak-ng/tr_languages.c
+index ea29e4cd..374b9444 100644
+--- a/src/libespeak-ng/tr_languages.c
++++ b/src/libespeak-ng/tr_languages.c
+@@ -254,6 +254,7 @@ static Translator *NewTranslator(void)
+ 	tr->dict_min_size = 0;
+ 	tr->data_dictrules = NULL; // language_1   translation rules file
+ 	tr->data_dictlist = NULL;  // language_2   dictionary lookup file
++	tr->allocated_dictlist = NULL;
+ 
+ 	tr->transpose_min = 0x60;
+ 	tr->transpose_max = 0x17f;
+diff --git a/src/libespeak-ng/translate.c b/src/libespeak-ng/translate.c
+index 34cc0e1f..67951a78 100644
+--- a/src/libespeak-ng/translate.c
++++ b/src/libespeak-ng/translate.c
+@@ -117,8 +117,7 @@ void DeleteTranslator(Translator *tr)
+ {
+ 	if (!tr) return;
+ 
+-	if (tr->data_dictlist != NULL)
+-		free(tr->data_dictlist);
++	free(tr->allocated_dictlist);
+ 	free(tr);
+ }
+ 
+@@ -221,7 +220,20 @@ static void SegmentReplacement(Translator *tr, const char *text, char *out, int
+ 
+ static int TranslateWordWithBounds(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_remaining, char *word_out, int depth)
+ {
+-	char words_phonemes[N_WORD_PHONEMES]; // a word translated into phoneme codes
++	// Each recursive expansion retains its own buffers, without growing the Pico stack.
++	enum { REPLACEMENT_LEVELS = 4, CONCURRENT_WORDS = 6 };
++	static struct WordReplacement {
++		char phonemes[N_WORD_PHONEMES];
++		char segmented[2 + N_WORD_BYTES * 2];
++		char replacement[N_WORD_BYTES + 1];
++	} buffers[CONCURRENT_WORDS];
++	static unsigned active;
++	if (active == CONCURRENT_WORDS) {
++		word_phonemes[0] = 0;
++		return 0;
++	}
++	struct WordReplacement *scratch = &buffers[active++];
++	char *words_phonemes = scratch->phonemes;
+ 	char *phonemes = words_phonemes;
+ 
+ 
+@@ -231,10 +243,10 @@ static int TranslateWordWithBounds(Translator *tr, char *word_start, WORD_TAB *w
+ 		// so that emoji and other characters are pronounced correctly.
+ 		// The buffer allows for a space inserted after every character of
+ 		// the replacement by SegmentReplacement().
+-		char word[2+N_WORD_BYTES*2];
++		char *word = scratch->segmented;
+ 		word[0] = 0;
+ 		word[1] = ' ';
+-		SegmentReplacement(tr, word_out, word+2, sizeof(word)-2);
++		SegmentReplacement(tr, word_out, word + 2, sizeof(scratch->segmented) - 2);
+ 		word_out = word+2;
+ 
+ 			bool first_word = true;
+@@ -263,13 +275,13 @@ static int TranslateWordWithBounds(Translator *tr, char *word_start, WORD_TAB *w
+ 			// However, dictionary_skipwords value is still needed outside this scope.
+ 			// So we backup and restore it at the end of this scope.
+ 			int skipwords = dictionary_skipwords;
+-			if (depth < 3) {
++			if (depth + 1 < REPLACEMENT_LEVELS) {
+ 				// translate through TranslateWordWithBounds so that a replacement
+ 				// word which itself has a $textmode entry is expanded too: eg. an
+ 				// emoji entry replaces the emoji by hanzi, and the hanzi words map
+ 				// to pinyin through *_list. The depth limit guards against an
+ 				// entry cycle in the dictionary (a $textmode b, b $textmode a).
+-				char word_replacement2[N_WORD_BYTES+1];
++				char *word_replacement2 = scratch->replacement;
+ 				word_replacement2[0] = 0;
+ 				TranslateWordWithBounds(tr, word_out, wtab, wtab_remaining, word_replacement2, depth+1);
+ 			} else
+@@ -307,6 +319,7 @@ static int TranslateWordWithBounds(Translator *tr, char *word_start, WORD_TAB *w
+ 			snprintf(word_phonemes, sizeof(word_phonemes), "%s", words_phonemes);
+ 		}
+ 	}
++	--active;
+ 	return flags;
+ }
+ 
+@@ -378,15 +391,16 @@ static int SetAlternateTranslator(const char *new_language, Translator **transla
+ 		}
+ 
+ 		if (*translator == NULL) {
+-			*translator = SelectTranslator(new_language);
+-			strcpy(translator_language, new_language);
+-
+-			if (LoadDictionary(*translator, (*translator)->dictionary_name, 0) != 0) {
++			Translator *candidate = SelectTranslator(new_language);
++			if (candidate == NULL || LoadDictionary(candidate, candidate->dictionary_name, 0) != 0) {
++				DeleteTranslator(candidate);
+ 				SelectPhonemeTable(voice->phoneme_tab_ix); // revert to original phoneme table
+-				new_phoneme_tab = -1;
+ 				translator_language[0] = 0;
++				return -1;
+ 			}
+-			(*translator)->phoneme_tab_ix = new_phoneme_tab;
++			candidate->phoneme_tab_ix = new_phoneme_tab;
++			*translator = candidate;
++			strncpy0(translator_language, new_language, 20);
+ 		}
+ 	}
+ 	if (*translator != NULL)
+@@ -426,9 +440,9 @@ static int TranslateWord2(Translator *tr, char *word, WORD_TAB *wtab, int wtab_r
+ 	int len;
+ 	int bad_phoneme;
+ 	int word_flags;
+-	char word_copy[N_WORD_BYTES+1];
+-	char word_replaced[N_WORD_BYTES+1];
+-	char old_dictionary_name[40];
++	static char word_copy[N_WORD_BYTES+1];
++	static char word_replaced[N_WORD_BYTES+1];
++	static char old_dictionary_name[40];
+ 
+ 	len = wtab->length;
+ 	if (len > 31) len = 31;
+@@ -1110,12 +1124,12 @@ void TranslateClauseWithTerminator(Translator *tr, int *tone_out, char **voice_c
+ 	int n_digits;
+ 	int charix_top = 0;
+ 
+-	short charix[N_TR_SOURCE+4];
+-	WORD_TAB words[N_CLAUSE_WORDS];
++	static short charix[N_TR_SOURCE+4];
++	static WORD_TAB words[N_CLAUSE_WORDS];
+ 	static char voice_change_name[40];
+ 	int word_count = 0; // index into words
+ 
+-	char sbuf[N_TR_SOURCE];
++	static char sbuf[N_TR_SOURCE];
+ 
+ 	int terminator;
+ 	int tone;
+@@ -1134,8 +1148,8 @@ void TranslateClauseWithTerminator(Translator *tr, int *tone_out, char **voice_c
+ 		clause_start_char = 0;
+ 	clause_start_word = count_words + 1;
+ 
+-	for (ix = 0; ix < N_TR_SOURCE; ix++)
+-		charix[ix] = 0;
++	memset(charix, 0, sizeof(charix));
++	memset(words, 0, sizeof(words));
+ 	MAKE_MEM_UNDEFINED(&source, sizeof(source));
+ 	terminator = ReadClause(tr, source, charix, &charix_top, N_TR_SOURCE, &tone, voice_change_name);
+ 
+@@ -1719,7 +1733,7 @@ void TranslateClauseWithTerminator(Translator *tr, int *tone_out, char **voice_c
+ 		char *pn;
+ 		char *pw;
+ 		char number_buf[150];
+-		WORD_TAB num_wtab[N_CLAUSE_WORDS]; // copy of 'words', when splitting numbers into parts
++		static WORD_TAB num_wtab[N_CLAUSE_WORDS]; // split numbers
+ 
+ 		// start speaking at a specified word position in the text?
+ 		count_words++;
+diff --git a/src/libespeak-ng/translate.h b/src/libespeak-ng/translate.h
+index 16defdfc..813942c7 100644
+--- a/src/libespeak-ng/translate.h
++++ b/src/libespeak-ng/translate.h
+@@ -40,8 +40,13 @@ extern "C"
+ #define N_WORD_PHONEMES  200 // max phonemes in a word
+ #define N_WORD_BYTES     160 // max bytes for the UTF8 characters in a word
+ #define N_PHONEME_BYTES  160 // max bytes for a phoneme
+-#define N_CLAUSE_WORDS   300 // max words in a clause
+-#define N_TR_SOURCE      800 // the source text of a single clause (UTF8 bytes)
++#if PICO_ESPEAK_MAPPED_DATA
++#define N_CLAUSE_WORDS   150 // max words in a clause
++#define N_TR_SOURCE      400 // clause text in UTF-8 bytes
++#else
++#define N_CLAUSE_WORDS   300
++#define N_TR_SOURCE      800
++#endif
+ 
+ #define N_RULE_GROUP2    120 // max num of two-letter rule chains
+ #define N_HASH_DICT     1024
+@@ -576,6 +581,7 @@ typedef struct {
+ 
+ 	char *data_dictrules;     // language_1   translation rules file
+ 	char *data_dictlist;      // language_2   dictionary lookup file
++	void *allocated_dictlist; // owned only when read into RAM
+ 	char *dict_hashtab[N_HASH_DICT];   // hash table to index dictionary lookup file
+ 	char *letterGroups[N_LETTER_GROUPS];
+ 
+diff --git a/src/libespeak-ng/translateword.c b/src/libespeak-ng/translateword.c
+index 127ba325..69e6e5dc 100644
+--- a/src/libespeak-ng/translateword.c
++++ b/src/libespeak-ng/translateword.c
+@@ -171,7 +171,18 @@ static bool LookupEmojiBaseSequence(Translator *tr, char **wordptr, unsigned int
+ 	return true;
+ }
+ 
+-int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_remaining, char *word_out, bool *any_stressed_words, ALPHABET *current_alphabet, char word_phonemes[], size_t size_word_phonemes)
++typedef struct {
++	char phonemes[N_WORD_PHONEMES];
++	char phonemes2[N_WORD_PHONEMES];
++	char prefix_phonemes[N_WORD_PHONEMES];
++	char unpron_phonemes[N_WORD_PHONEMES];
++	char end_phonemes[N_WORD_PHONEMES];
++	char end_phonemes2[N_WORD_PHONEMES];
++	char word_copy[N_WORD_BYTES];
++	char word_copy2[N_WORD_BYTES];
++} WordTranslationBuffers;
++
++static int TranslateWord3WithBuffers(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_remaining, char *word_out, bool *any_stressed_words, ALPHABET *current_alphabet, char word_phonemes[], size_t size_word_phonemes, WordTranslationBuffers *scratch)
+ {
+ 	// word1 is terminated by space (0x20) character
+ 
+@@ -188,14 +199,14 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 	int prefix_type = 0;
+ 	int prefix_stress;
+ 	char *wordx;
+-	char phonemes[N_WORD_PHONEMES];
+-	char phonemes2[N_WORD_PHONEMES];
+-	char prefix_phonemes[N_WORD_PHONEMES];
+-	char unpron_phonemes[N_WORD_PHONEMES];
+-	char end_phonemes[N_WORD_PHONEMES];
+-	char end_phonemes2[N_WORD_PHONEMES];
+-	char word_copy[N_WORD_BYTES];
+-	char word_copy2[N_WORD_BYTES];
++	char *phonemes = scratch->phonemes;
++	char *phonemes2 = scratch->phonemes2;
++	char *prefix_phonemes = scratch->prefix_phonemes;
++	char *unpron_phonemes = scratch->unpron_phonemes;
++	char *end_phonemes = scratch->end_phonemes;
++	char *end_phonemes2 = scratch->end_phonemes2;
++	char *word_copy = scratch->word_copy;
++	char *word_copy2 = scratch->word_copy2;
+ 	int word_copy_length;
+ 	char prefix_chars[0x3f + 2];
+ 	bool found = false;
+@@ -344,7 +355,7 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 				return 0;
+ 			}
+ 
+-			found = TranslateNumber(tr, word1, phonemes, phonemes + sizeof(phonemes), dictionary_flags, wtab, wtab_remaining, 0);
++			found = TranslateNumber(tr, word1, phonemes, phonemes + sizeof(scratch->phonemes), dictionary_flags, wtab, wtab_remaining, 0);
+ 		}
+ 
+ 		if (!found && ((wflags & FLAG_UPPERS) != FLAG_FIRST_UPPER)) {
+@@ -353,7 +364,7 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 			if ((tr->langopts.numbers & NUM_ROMAN) || ((tr->langopts.numbers & NUM_ROMAN_CAPITALS) && (wflags & FLAG_ALL_UPPER))) {
+ 				if ((wflags & FLAG_LAST_WORD) || (wtab_remaining <= 1) || !(wtab[1].flags & FLAG_NOSPACE)) {
+ 					// don't use Roman number if this word is not separated from the next word (eg. "XLTest")
+-					if ((found = TranslateRoman(tr, word1, phonemes, phonemes + sizeof(phonemes), wtab, wtab_remaining)) != 0)
++					if ((found = TranslateRoman(tr, word1, phonemes, phonemes + sizeof(scratch->phonemes), wtab, wtab_remaining)) != 0)
+ 						dictionary_flags[0] |= FLAG_ABBREV; // prevent emphasis if capitals
+ 				}
+ 			}
+@@ -466,7 +477,6 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 				// loopcount guards against an endless loop
+ 				if (confirm_prefix && !(end_type & SUFX_B)) {
+ 					int end2;
+-					char end_phonemes2[N_WORD_PHONEMES];
+ 
+ 					// remove any standard suffix and confirm that the prefix is still recognised
+ 					phonemes2[0] = 0;
+@@ -482,7 +492,7 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 							strcpy(phonemes, phonemes2);
+ 							strcpy(end_phonemes, end_phonemes2);
+ 							if (option_phonemes & espeakPHONEMES_TRACE) {
+-								DecodePhonemes(end_phonemes, end_phonemes2, sizeof(end_phonemes2));
++								DecodePhonemes(end_phonemes, end_phonemes2, sizeof(scratch->end_phonemes2));
+ 								fprintf(f_trans, "  suffix [%s]\n\n", end_phonemes2);
+ 							}
+ 						}
+@@ -543,7 +553,7 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 					// this loop runs up to 50 times, so truncate rather than
+ 					// overflow prefix_phonemes
+ 					size_t len = strlen(prefix_phonemes);
+-					snprintf(prefix_phonemes + len, sizeof(prefix_phonemes) - len, "%s", end_phonemes);
++					snprintf(prefix_phonemes + len, sizeof(scratch->prefix_phonemes) - len, "%s", end_phonemes);
+ 				}
+ 				end_phonemes[0] = 0;
+ 
+@@ -803,6 +813,22 @@ int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_re
+ 	return dictionary_flags[0];
+ }
+ 
++int TranslateWord3(Translator *tr, char *word_start, WORD_TAB *wtab, int wtab_remaining, char *word_out, bool *any_stressed_words, ALPHABET *current_alphabet, char word_phonemes[], size_t size_word_phonemes)
++{
++	// Dictionary substitutions and number translation can call back into this function.
++	enum { MAX_ACTIVE_TRANSLATIONS = 6 };
++	static WordTranslationBuffers buffers[MAX_ACTIVE_TRANSLATIONS];
++	static unsigned active;
++	if (active == MAX_ACTIVE_TRANSLATIONS) {
++		word_phonemes[0] = 0;
++		return 0;
++	}
++	int flags = TranslateWord3WithBuffers(tr, word_start, wtab, wtab_remaining, word_out,
++		any_stressed_words, current_alphabet, word_phonemes, size_word_phonemes, &buffers[active++]);
++	--active;
++	return flags;
++}
++
+ 
+ void ApplySpecialAttribute2(Translator *tr, char *phonemes, int dict_flags)
+ {
+diff --git a/src/libespeak-ng/voices.c b/src/libespeak-ng/voices.c
+index 40a35ffa..60843ced 100644
+--- a/src/libespeak-ng/voices.c
++++ b/src/libespeak-ng/voices.c
+@@ -31,7 +31,7 @@
+ 
+ #if defined(_WIN32) || defined(_WIN64)
+ #include <windows.h>
+-#else
++#elif !PICO_ESPEAK_MAPPED_DATA
+ #include <dirent.h>
+ #endif
+ 
+@@ -52,6 +52,8 @@
+ #include "translate.h"                // for LANGUAGE_OPTIONS, DeleteTranslator
+ #include "wavegen.h"                  // for InitBreath
+ 
++#include <espeak-ng/pico_data.h>
++
+ static int AddToVoicesList(const char *fname, int len_path_voices, int is_language_file);
+ 
+ 
+@@ -741,6 +743,8 @@ voice_t *LoadVoice(const char *vname, int control)
+ 	if ((translator == NULL) && (!tone_only)) {
+ 		// not set by language attribute
+ 		translator = SelectTranslator(translator_name);
++		if (translator == NULL)
++			return NULL;
+ 	}
+ 
+ 	if (!tone_only) {
+@@ -760,12 +764,11 @@ voice_t *LoadVoice(const char *vname, int control)
+ 		voice->phoneme_tab_ix = ix;
+ 		translator->phoneme_tab_ix = ix;
+ 
+-		if (!(control & 8/*compiling phonemes*/)) {
+-			LoadDictionary(translator, new_dictionary, control & 4);
+-			if (dictionary_name[0] == 0) {
+-				DeleteTranslator(translator);
+-				return NULL; // no dictionary loaded
+-			}
++		if (!(control & 8/*compiling phonemes*/) && LoadDictionary(translator, new_dictionary, control & 4) != 0) {
++			DeleteTranslator(translator);
++			translator = NULL;
++			voice_identifier[0] = 0;
++			return NULL; // no dictionary loaded
+ 		}
+ 
+ 		/* Terminate languages list with a zero-priority entry */
+@@ -814,6 +817,18 @@ static char *ExtractVoiceVariantName(char *vname, int variant_num, int add_dir)
+ 	return variant_name;
+ }
+ 
++static bool VoiceVariantExists(const char *name)
++{
++	if (name[0] == 0)
++		return true;
++	char path[N_PATH_BUF];
++	snprintf(path, sizeof(path), "%s%cvoices%c%s", path_home, PATHSEP, PATHSEP, name);
++	if (GetFileLength(path) > 0)
++		return true;
++	snprintf(path, sizeof(path), "%s%clang%c%s", path_home, PATHSEP, PATHSEP, name);
++	return GetFileLength(path) > 0;
++}
++
+ voice_t *LoadVoiceVariant(const char *vname, int variant_num)
+ {
+ 	// Load a voice file.
+@@ -825,6 +840,8 @@ voice_t *LoadVoiceVariant(const char *vname, int variant_num)
+ 
+ 	strncpy0(buf, vname, sizeof(buf));
+ 	variant_name = ExtractVoiceVariantName(buf, variant_num, 1);
++	if (!VoiceVariantExists(variant_name))
++		return NULL;
+ 
+ 	if ((v = LoadVoice(buf, 0)) == NULL)
+ 		return NULL;
+@@ -1112,8 +1129,8 @@ char const *SelectVoice(espeak_VOICE *voice_select, int *found)
+ 	espeak_VOICE *vp = NULL;
+ 	espeak_VOICE *vp2;
+ 	espeak_VOICE voice_select2;
+-	espeak_VOICE *voices[N_VOICES_LIST]; // list of candidates
+-	espeak_VOICE *voices2[N_VOICES_LIST+N_VOICE_VARIANTS];
++	static espeak_VOICE *voices[N_VOICES_LIST]; // list of candidates
++	static espeak_VOICE *voices2[N_VOICES_LIST+N_VOICE_VARIANTS];
+ 	static espeak_VOICE voice_variants[N_VOICE_VARIANTS];
+ 	static char voice_id[50];
+ 
+@@ -1233,7 +1250,24 @@ static void GetVoices(const char *path, int len_path_voices, int is_language_fil
+ {
+ 	char fname[N_PATH_BUF];
+ 
+-#if PLATFORM_WINDOWS
++#if PICO_ESPEAK_MAPPED_DATA
++	int length = snprintf(fname, sizeof(fname), "%s%cmanifest", path, PATHSEP);
++	if (length < 0 || (size_t)length >= sizeof(fname))
++		return;
++	FILE *manifest = fopen(fname, "r");
++	if (manifest == NULL)
++		return;
++
++	char entry[N_PATH_BUF];
++	while (n_voices_list < N_VOICES_LIST - 2 && fgets_strip(entry, sizeof(entry), manifest) != NULL) {
++		if (entry[0] == 0 || entry[0] == '.')
++			continue;
++		length = snprintf(fname, sizeof(fname), "%s%c%s", path, PATHSEP, entry);
++		if (length >= 0 && (size_t)length < sizeof(fname) && GetFileLength(fname) > 0)
++			AddToVoicesList(fname, len_path_voices, is_language_file);
++	}
++	fclose(manifest);
++#elif PLATFORM_WINDOWS
+ 	WIN32_FIND_DATAA FindFileData;
+ 	HANDLE hFind = INVALID_HANDLE_VALUE;
+ 
+@@ -1294,6 +1328,8 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByFile(const char *filename)
+ 	strncpy0(buf, filename, sizeof(buf));
+ 
+ 	variant_name = ExtractVoiceVariantName(buf, 0, 1);
++	if (!VoiceVariantExists(variant_name))
++		return ENS_VOICE_NOT_FOUND;
+ 
+ 	memset(&voice_selector, 0, sizeof(voice_selector));
+ 	voice_selector.name = (char *)filename; // include variant name in voice stack ??
+@@ -1302,8 +1338,8 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByFile(const char *filename)
+ 	// This may avoid the need to call espeak_ListVoices().
+ 
+ 	if (LoadVoice(buf, 0x10) != NULL) {
+-		if (variant_name[0] != 0)
+-			LoadVoice(variant_name, 2);
++		if (variant_name[0] != 0 && LoadVoice(variant_name, 2) == NULL)
++			return ENS_VOICE_NOT_FOUND;
+ 
+ 		DoVoiceChange(voice);
+ 		voice_selector.languages = voice->language_name;
+@@ -1325,10 +1361,12 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByName(const char *name)
+ 	strncpy0(buf, name, sizeof(buf));
+ 
+ 	variant_name = ExtractVoiceVariantName(buf, 0, 1);
++	if (!VoiceVariantExists(variant_name))
++		return ENS_VOICE_NOT_FOUND;
+ 
+ 	for (ix = 0;; ix++) {
+ 		// convert voice name to lower case  (ascii)
+-		if ((buf[ix] = tolower(buf[ix])) == 0)
++		if ((buf[ix] = tolower((unsigned char)buf[ix])) == 0)
+ 			break;
+ 	}
+ 
+@@ -1339,8 +1377,8 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByName(const char *name)
+ 	// This may avoid the need to call espeak_ListVoices().
+ 
+ 	if (LoadVoice(buf, 1) != NULL) {
+-		if (variant_name[0] != 0)
+-			LoadVoice(variant_name, 2);
++		if (variant_name[0] != 0 && LoadVoice(variant_name, 2) == NULL)
++			return ENS_VOICE_NOT_FOUND;
+ 
+ 		DoVoiceChange(voice);
+ 		voice_selector.languages = voice->language_name;
+@@ -1353,8 +1391,8 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByName(const char *name)
+ 
+ 	if ((v = SelectVoiceByName(voices_list, buf)) != NULL) {
+ 		if (LoadVoice(v->identifier, 0) != NULL) {
+-			if (variant_name[0] != 0)
+-				LoadVoice(variant_name, 2);
++			if (variant_name[0] != 0 && LoadVoice(variant_name, 2) == NULL)
++				return ENS_VOICE_NOT_FOUND;
+ 			DoVoiceChange(voice);
+ 			voice_selector.languages = voice->language_name;
+ 			SetVoiceStack(&voice_selector, variant_name);
+@@ -1373,7 +1411,8 @@ ESPEAK_NG_API espeak_ng_STATUS espeak_ng_SetVoiceByProperties(espeak_VOICE *voic
+ 	if (voice_found == 0)
+ 		return ENS_VOICE_NOT_FOUND;
+ 
+-	LoadVoiceVariant(voice_id, 0);
++	if (voice_id == NULL || LoadVoiceVariant(voice_id, 0) == NULL)
++		return ENS_VOICE_NOT_FOUND;
+ 	DoVoiceChange(voice);
+ 	SetVoiceStack(voice_selector, "");
+ 
+diff --git a/src/libespeak-ng/wavegen.c b/src/libespeak-ng/wavegen.c
+index e340202c..171f6dd0 100644
+--- a/src/libespeak-ng/wavegen.c
++++ b/src/libespeak-ng/wavegen.c
+@@ -97,8 +97,8 @@ static unsigned char *amplitude_env = NULL;
+ static int samplecount = 0; // number done
+ static int samplecount_start = 0; // count at start of this segment
+ static int end_wave = 0; // continue to end of wave cycle
+-static int wavephase;
+-static int phaseinc;
++static uint32_t wavephase;
++static uint32_t phaseinc;
+ static int cycle_samples; // number of samples in a cycle at current pitch
+ static int cbytes;
+ static int hf_factor;
+@@ -772,7 +772,7 @@ static int Wavegen(int length, int modulation, bool resume, frame_t *fr1, frame_
+ 				AdvanceParameters();
+ 
+ 			// pitch is Hz<<12
+-			phaseinc = (wdata.pitch>>7) * PHASE_INC_FACTOR;
++			phaseinc = (uint32_t)(wdata.pitch >> 7) * PHASE_INC_FACTOR;
+ 			cycle_samples = samplerate/(wdata.pitch >> 12); // sr/(pitch*2)
+ 			hf_factor = wdata.pitch >> 11;
+ 
+@@ -792,9 +792,9 @@ static int Wavegen(int length, int modulation, bool resume, frame_t *fr1, frame_
+ 
+ 		samplecount++;
+ 
+-		if (wavephase > 0) {
++		if (wavephase != 0 && wavephase < UINT32_C(0x80000000)) {
+ 			wavephase += phaseinc;
+-			if (wavephase < 0) {
++			if (wavephase >= UINT32_C(0x80000000)) {
+ 				// sign has changed, reached a quiet point in the waveform
+ 				cbytes = wavemult_offset - (cycle_samples)/2;
+ 				if (samplecount > nsamples)

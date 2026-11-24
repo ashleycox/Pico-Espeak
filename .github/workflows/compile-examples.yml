@@ -1,0 +1,44 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: tests/run-host.sh
+
+  pico:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        board:
+          - rpipico
+          - rpipicow
+          - rpipico2:arch=arm
+          - rpipico2w:arch=arm
+          - rpipico2:arch=riscv
+          - rpipico2w:arch=riscv
+    steps:
+      - uses: actions/checkout@v7
+      - uses: arduino/setup-arduino-cli@v2.0.0
+      - name: Install Arduino-Pico
+        run: |
+          index=https://github.com/earlephilhower/arduino-pico/releases/download/global/package_rp2040_index.json
+          arduino-cli core update-index --additional-urls "$index"
+          arduino-cli core install rp2040:rp2040@6.4.0 --additional-urls "$index"
+      - name: Compile examples
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          for sketch in examples/*/; do
+            arduino-cli compile --fqbn "rp2040:rp2040:$BOARD" --library "$GITHUB_WORKSPACE" "$sketch"
+          done
