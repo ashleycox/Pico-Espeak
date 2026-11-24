@@ -45,4 +45,20 @@ int main()
     const auto finalized = file.bytes;
     assert(!wav.begin(44100)); // The caller must supply an empty file.
     assert(file.bytes == finalized);
+
+    fs::File fixedRateFile;
+    ESpeakWavSink fixedRateWav(fixedRateFile);
+    ESpeakResamplingSink fixedRate(fixedRateWav, 48000);
+    assert(fixedRate.begin(24000));
+    assert(fixedRate.writeSamples(samples, 5) == 5);
+    fixedRate.flush();
+    assert(fixedRateWav.samplesRecorded() == 10);
+
+    assert(fixedRate.changeSampleRate(16000));
+    assert(fixedRate.writeSamples(samples, 5) == 5);
+    fixedRate.flush();
+    fixedRate.end();
+    assert(fixedRateWav.finalized() && fixedRateWav.samplesRecorded() == 25);
+    assert(fixedRateFile.size() == 94 && fixedRateFile.bytes[40] == 50);
+    assert(fixedRateFile.bytes[24] == 0x80 && fixedRateFile.bytes[25] == 0xbb);
 }

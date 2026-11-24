@@ -14,6 +14,10 @@
 #include <mutex>
 #endif
 
+#if __has_include(<FS.h>)
+namespace fs { class File; }
+#endif
+
 namespace espeak {
 
 struct Config {
@@ -66,6 +70,8 @@ struct SpeechResult {
 using EventCallback = void (*)(const espeak_EVENT &event, void *userData);
 using PhonemeCallback = void (*)(const char *phoneme, void *userData);
 using UriCallback = int (*)(int type, const char *uri, const char *base, void *userData);
+// Return bytes written, zero at EOF, or a negative value on read failure.
+using TextReader = int (*)(char *destination, size_t capacity, void *userData);
 
 class Synth {
 public:
@@ -86,6 +92,12 @@ public:
     bool say(const char *text);
     bool say(const String &text) { return say(text.c_str()); }
     bool say(const __FlashStringHelper *text);
+    // Speak plain, unterminated UTF-8 text through one blocking, interruptible operation.
+    bool sayStream(TextReader reader, void *userData = nullptr);
+    bool sayStream(Stream &source, size_t byteCount);
+#if __has_include(<FS.h>)
+    bool sayStream(fs::File &source, size_t byteCount);
+#endif
     bool synthesize(const char *text,
                     unsigned int flags,
                     unsigned int *identifier = nullptr,
@@ -236,7 +248,7 @@ private:
     int synthCallback(short *wav, int sampleCount, espeak_EVENT *events);
     bool tryRequestStop();
     bool startSpeech();
-    bool finishSpeech(espeak_ng_STATUS status);
+    bool finishSpeech(espeak_ng_STATUS status, const char *message = nullptr);
     bool synthesizeQueued(const char *text, unsigned int flags);
     bool onOwnerCore() const;
     bool checkIdle();
@@ -442,3 +454,4 @@ using ESpeakBackgroundSynth = espeak::BackgroundSynth;
 using ESpeakEventCallback = espeak::EventCallback;
 using ESpeakPhonemeCallback = espeak::PhonemeCallback;
 using ESpeakUriCallback = espeak::UriCallback;
+using ESpeakTextReader = espeak::TextReader;

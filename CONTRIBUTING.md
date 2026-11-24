@@ -17,11 +17,9 @@ tests/run-host.sh
 python3 -m unittest discover -s tests -p test_pack_generator.py
 ```
 
-The host tests exercise synthesis, flash images, queue cancellation and WAV files without a board.
-Use `SANITIZE=1 tests/run-host.sh` with Clang or GCC to check memory use.
-If you change playback, try a short and a long announcement over PWM and
-I2S. Check that the final syllables play, then interrupt a long announcement
-with the menu sketch and confirm the next one starts.
+The host tests cover synthesis, flash images, queue cancellation, streamed
+text, resampling and WAV files. Use `SANITIZE=1 tests/run-host.sh` with Clang
+or GCC to check memory use.
 
 Changes to vendored eSpeak NG files belong in the updater or its patch.
 See [NOTICE.md](NOTICE.md) for the source revision and

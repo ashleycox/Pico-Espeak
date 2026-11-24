@@ -46,7 +46,7 @@ jobs:
             board="$BOARD"
             case "$(basename "$sketch")" in
               FlashVoicePack) board="$BOARD${separator}flash=${flash}_1048576" ;;
-              RecordToWav) board="$BOARD${separator}flash=${flash}_524288" ;;
+              ReadTextFile|RecordToWav) board="$BOARD${separator}flash=${flash}_524288" ;;
             esac
             arduino-cli compile --fqbn "rp2040:rp2040:$board" --library "$GITHUB_WORKSPACE" "$sketch"
           done

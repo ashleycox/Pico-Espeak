@@ -68,6 +68,39 @@ if (result.finished()) {
 before the library copies them. The limit counts bytes, so a UTF-8 code point
 can count as more than one. Zero restores the default of unlimited text size.
 
+## Read text in chunks
+
+Use `sayStream(stream, byteCount)` for a finite Arduino `Stream`, such as an
+open LittleFS or SD file. Pass the number of text bytes remaining from the
+current position. For other sources, pass an `ESpeakTextReader` to
+`sayStream(reader, context)`. The reader fills the supplied buffer and returns
+the number of bytes read, zero for end of input, or a negative value for an
+I/O error.
+
+```cpp
+File passage = LittleFS.open("/passage.txt", "r");
+if (passage && !speech.sayStream(passage, passage.size())) {
+    Serial.println(speech.lastErrorText());
+}
+```
+
+`sayStream()` reads plain UTF-8 text in chunks of up to 512 bytes and blocks
+the playback core until speech finishes. It prefers sentence and word breaks,
+preserves complete UTF-8 characters and accepts an optional UTF-8 byte order
+mark. Event positions are relative to the current chunk. Use `synthesize()`
+for SSML.
+
+Another core can call `requestStop()` to interrupt a streamed passage.
+Custom readers should return promptly so the synthesizer can check for
+cancellation. A generic Arduino stream uses its configured timeout while
+waiting for more bytes. The file overload reports early end of input
+immediately.
+
+To try a file, open [ReadTextFile](../examples/ReadTextFile/ReadTextFile.ino).
+On a 2 MB Pico, select **Sketch: 1536KB, FS: 512KB**. Upload the example's
+`data` folder to a spare or backed-up LittleFS partition, then upload the
+sketch. [Arduino-Pico filesystem uploader](https://arduino-pico.readthedocs.io/en/latest/fs.html#uploading-files-to-the-littlefs-file-system-on-ide-2-x-rp2040-and-rp2350)
+
 ## Work with speech data
 
 - `synthesize(text, espeakCHARS_UTF8 | espeakSSML)` handles SSML. Include
@@ -83,8 +116,10 @@ can count as more than one. Zero restores the default of unlimited text size.
   short writes. A custom sink can drain pending audio in `flush()` and drop
   it on interruption in `discard()`. To support interruption during a long
   drain, override `flushUntil()` and co-operate with its stop check.
-  `lastErrorText()` can provide the specific cause of a sink failure. See
-  the [audio guide](audio.md) for WAV output and DMA buffering.
+  `lastErrorText()` can provide the specific cause of a sink failure.
+  Override `changeSampleRate()` if a sink can switch rates in place. The
+  default ends the sink and opens it again. See the [audio guide](audio.md)
+  for fixed-rate PCM, WAV output and DMA buffering.
 
 The C APIs in [`speak_lib.h`](../src/espeak-ng/speak_lib.h) and
 [`espeak_ng.h`](../src/espeak-ng/espeak_ng.h) expose the bundled engine.

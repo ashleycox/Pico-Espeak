@@ -24,6 +24,12 @@ public:
 
     virtual bool begin(int sampleRate) = 0;
     virtual void end() = 0;
+    // Change the PCM rate between drained streams.
+    virtual bool changeSampleRate(int sampleRate)
+    {
+        end();
+        return begin(sampleRate);
+    }
     // Accept signed 16-bit mono PCM. Wait for space as needed and return the
     // number of samples accepted. A short write indicates an output error.
     virtual size_t writeSamples(const int16_t *samples, size_t count) = 0;
@@ -38,7 +44,7 @@ public:
     // Drop pending audio and leave the sink ready for the next utterance.
     virtual bool discard() { return true; }
     virtual bool ready() const = 0;
-    // Optional diagnostic with storage that remains valid across a restart.
+    // Optional diagnostic, valid until the next non-const sink operation.
     virtual const char *lastErrorText() const { return nullptr; }
 };
 
@@ -51,6 +57,52 @@ public:
 
 private:
     bool _ready = false;
+};
+
+// Convert signed mono PCM to a fixed rate. The downstream sink must outlive
+// this adapter and is started at outputSampleRate on begin().
+class ResamplingSink final : public AudioSink {
+public:
+    ResamplingSink(AudioSink &downstream, int outputSampleRate);
+    ResamplingSink(const ResamplingSink &) = delete;
+    ResamplingSink &operator=(const ResamplingSink &) = delete;
+
+    bool begin(int sampleRate) override;
+    void end() override;
+    bool changeSampleRate(int sampleRate) override;
+    size_t writeSamples(const int16_t *samples, size_t count) override;
+    void flush() override;
+    void flushUntil(AudioStopCheck stop, void *userData) override;
+    bool discard() override;
+    bool ready() const override;
+    const char *lastErrorText() const override { return _error; }
+
+    int inputSampleRate() const { return _inputRate; }
+    int outputSampleRate() const { return _outputRate; }
+
+private:
+    bool interpolate(int16_t next, AudioStopCheck stop = nullptr, void *userData = nullptr);
+    bool average(int16_t sample);
+    bool emit(int16_t sample);
+    bool writeBuffered();
+    bool failDownstream(const char *fallback);
+    void resetStream();
+
+    AudioSink &_downstream;
+    const int _outputRate;
+    int _inputRate = 0;
+    // Interpolation uses ticks per input interval. Averaging uses the same
+    // timescale to count ticks accumulated in the current output interval.
+    uint32_t _phase = 0;
+    int64_t _area = 0;
+    int16_t _previous = 0;
+    int16_t _buffer[32];
+    size_t _buffered = 0;
+    char _downstreamError[160] = {};
+    const char *_error = nullptr;
+    bool _hasPrevious = false;
+    bool _needsFlush = false;
+    bool _failed = false;
 };
 
 bool playTestTone(AudioSink &sink,
@@ -168,6 +220,7 @@ private:
 
 using ESpeakAudioSink = espeak::AudioSink;
 using ESpeakNullAudioSink = espeak::NullAudioSink;
+using ESpeakResamplingSink = espeak::ResamplingSink;
 using espeak::playTestTone;
 
 #if ESPEAK_ARDUINO_HAS_AUDIOOUTPUTBASE

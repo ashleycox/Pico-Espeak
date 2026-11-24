@@ -23,6 +23,31 @@ Larger buffers use more RAM and can increase playback latency.
 underrun during speech. Check it on the playback core. It can help diagnose
 buffer starvation, but it gives no count or duration.
 
+## Use a fixed sample rate
+
+Wrap an audio sink in `ESpeakResamplingSink` when a DAC or mixer needs a
+fixed sample rate such as 44.1 or 48 kHz. Your downstream sink still
+receives signed 16-bit mono PCM. A custom mixer sink can use these samples
+alongside music or sound effects.
+
+```cpp
+ESpeakI2SSink i2s(10, 11, 12);
+ESpeakResamplingSink audio(i2s, 48000);
+ESpeakSynth speech;
+
+// In setup():
+i2s.setBuffering(8, 256);
+if (speech.begin(audio)) {
+    speech.say("The output runs at forty-eight kilohertz.");
+}
+```
+
+`speech.sampleRate()` reports the engine rate and `audio.outputSampleRate()`
+reports the rate delivered to the downstream sink. The adapter keeps the
+output at the chosen rate when the engine changes its rate. Try
+[FixedRateI2S](../examples/FixedRateI2S/FixedRateI2S.ino) with a DAC that
+accepts 48 kHz I2S.
+
 ## Save speech to WAV
 
 Include `ESpeakWav.h` and give an `ESpeakWavSink` an empty, writable file
@@ -31,6 +56,7 @@ from an Arduino-Pico filesystem such as LittleFS. Keep the file open until
 several calls to `say()`. Stopping an utterance removes its partial samples
 and keeps the earlier completed speech. `speech.end()` writes the final WAV
 header. Check `wav.finalized()` before treating the recording as complete.
+Wrap `wav` in `ESpeakResamplingSink` to record at a chosen rate.
 
 ```cpp
 File output = LittleFS.open("/announcement.wav", "w+");

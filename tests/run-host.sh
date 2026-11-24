@@ -29,7 +29,12 @@ PY
 "${CXX:-c++}" $flags -std=c++17 -Isrc tests/flash_pack.cpp src/ESpeakData.cpp -o "$build/flash-pack"
 "$build/flash-pack" "$build/voice-pack.bin"
 
-"${CXX:-c++}" $flags -std=c++17 -Itests/arduino_stubs -Isrc tests/wav_sink.cpp src/ESpeakWav.cpp -o "$build/wav-sink"
+"${CXX:-c++}" $flags -std=c++17 -Itests/arduino_stubs -Isrc \
+    tests/resampling_sink.cpp src/ESpeakResampling.cpp -o "$build/resampling-sink"
+"$build/resampling-sink"
+
+"${CXX:-c++}" $flags -std=c++17 -Itests/arduino_stubs -Isrc \
+    tests/wav_sink.cpp src/ESpeakWav.cpp src/ESpeakResampling.cpp -o "$build/wav-sink"
 "$build/wav-sink"
 
 "${CXX:-c++}" $flags -std=c++17 -pthread -Itests/arduino_stubs -Isrc \
@@ -37,3 +42,9 @@ PY
     src/ESpeakData.cpp src/ESpeakEnglishData.cpp src/espeak-ng/speechPlayer/src/*.cpp \
     "$build"/*.o -lm -o "$build/speech-queue"
 "$build/speech-queue"
+
+"${CXX:-c++}" $flags -std=c++17 -pthread -Itests/arduino_stubs -Isrc \
+    tests/streaming_text.cpp src/ESpeakStream.cpp src/ESpeakArduino.cpp src/ESpeakAudio.cpp \
+    src/ESpeakData.cpp src/ESpeakEnglishData.cpp src/espeak-ng/speechPlayer/src/*.cpp \
+    "$build"/*.o -lm -o "$build/streaming-text"
+"$build/streaming-text"

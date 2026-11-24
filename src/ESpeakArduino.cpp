@@ -1089,7 +1089,7 @@ bool Synth::selectInitialVoice(const char *language)
     return fail(EE_NOT_FOUND, "data pack contains no usable voice and dictionary", ENS_VOICE_NOT_FOUND);
 }
 
-bool Synth::finishSpeech(espeak_ng_STATUS status)
+bool Synth::finishSpeech(espeak_ng_STATUS status, const char *message)
 {
     if (status == ENS_OK && !stopRequested()) {
         _sink->flushUntil(speechStopped, this);
@@ -1117,7 +1117,7 @@ bool Synth::finishSpeech(espeak_ng_STATUS status)
     if (_audioFault) {
         return false;
     }
-    return rememberStatus(status);
+    return message != nullptr ? fail(legacyError(status), message, status) : rememberStatus(status);
 }
 
 bool Synth::synthesizeQueued(const char *text, unsigned int flags)
@@ -1144,8 +1144,7 @@ int Synth::synthCallback(short *wav, int sampleCount, espeak_EVENT *events)
             if (stopRequested()) {
                 return 1;
             }
-            _sink->end();
-            if (!_sink->begin(event->id.number)) {
+            if (!_sink->changeSampleRate(event->id.number)) {
                 audioFailure(_sink, "audio output could not change sample rate");
                 return 1;
             }

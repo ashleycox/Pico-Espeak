@@ -9,8 +9,8 @@ Arduino-Pico 6.4.0 and eSpeak NG 1.53.0 development sources. [Source revision](N
 
 1. Install the [Arduino-Pico board package](https://arduino-pico.readthedocs.io/en/latest/install.html)
    by Earle Philhower. Select your Pico, Pico W, Pico 2 or Pico 2 W in **Tools → Board**.
-2. Download this repository as a ZIP using **Code → Download ZIP**. In Arduino
-   IDE choose **Sketch → Include Library → Add .ZIP Library** and open it.
+2. Download **Source code (zip)** from the [latest release](https://github.com/ashleycox/Pico-Espeak/releases/latest).
+   In Arduino IDE choose **Sketch → Include Library → Add .ZIP Library** and open it.
 3. Open **File → Examples → Pico eSpeak → BasicPico**. On a 2 MB Pico with the
    stock flash layout, use **Tools → Flash Size → 2MB (no FS)**. Upload the sketch.
 
@@ -60,10 +60,11 @@ core. The `BackgroundMenu` example changes rate, volume, pitch and voice from
 the serial port. It also shows how to track and cancel an announcement by
 ticket.
 
-The [API guide](docs/api.md) covers voice menus, speech settings, custom PCM
-sinks, SSML and phoneme output. The [audio guide](docs/audio.md) covers WAV
-recording, I2S formats and buffering. To speak other languages, [build a voice
-pack](docs/data-packs.md) and put it in the sketch or a separate flash partition.
+Use `sayStream()` to read a UTF-8 file or another text source in chunks.
+The [API guide](docs/api.md) also covers voice menus, SSML and phoneme output.
+For audio mixing, `ESpeakResamplingSink` can supply PCM at your mixer’s
+sample rate. The [audio guide](docs/audio.md) covers fixed-rate output, WAV
+recording, I2S formats and buffering. Add languages with a [voice pack](docs/data-packs.md).
 
 ## License
 

@@ -15,6 +15,17 @@ using std::min;
 struct __FlashStringHelper;
 #define F(text) reinterpret_cast<const __FlashStringHelper *>(text)
 
+class Stream {
+public:
+    virtual ~Stream() = default;
+    virtual int read() = 0;
+    void setTimeout(unsigned long timeout) { _timeout = timeout; }
+    unsigned long getTimeout() { return _timeout; }
+
+private:
+    unsigned long _timeout = 1000;
+};
+
 class String {
 public:
     String() = default;
@@ -55,6 +66,12 @@ inline uint32_t micros()
 {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
+inline unsigned long millis()
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<unsigned long>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
 }
 
 inline void delay(unsigned long milliseconds)
