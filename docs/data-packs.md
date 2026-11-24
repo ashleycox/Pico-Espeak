@@ -54,3 +54,47 @@ python3 extras/update_espeak_ng.py --update-core --preset english \
 
 The host tools accept `--ref` when evaluating a particular eSpeak NG revision.
 Use the same source revision for the engine and compiled data.
+
+## Keep the voice pack separate from the sketch
+
+The [FlashVoicePack example](../examples/FlashVoicePack/FlashVoicePack.ino)
+uses a binary voice pack in a dedicated flash partition. Flashing a new voice
+pack at that address leaves the sketch in place. `FlashDataPack` verifies the
+pack's revision, length and checksum before eSpeak uses it.
+
+1. Select a flash layout with a 1 MB or larger filesystem partition. This
+   example uses that partition exclusively for speech data. Use a board or
+   partition whose contents you can replace.
+2. Upload `FlashVoicePack` and read the voice pack address and capacity from
+   the Serial Monitor. These depend on the flash layout.
+3. Generate a binary pack with the language selected in the sketch. For the
+   English example and a 1 MB partition, run the command below.
+4. Reboot the Pico into BOOTSEL mode. In the `picotool` command, replace
+   `ADDRESS` with the exact hex address reported by the example. Reset the
+   board when the verified write finishes.
+
+```sh
+python3 extras/update_espeak_ng.py --preset minimal-en \
+    --format binary --max-data-bytes 1048576 --data-out voice-pack.bin
+picotool load --no-overwrite --verify voice-pack.bin -t bin -o ADDRESS
+```
+
+Use the reported capacity as the byte limit for other flash layouts. Recheck
+the address if you change the board or partition size. To consume a binary
+pack from your own memory-mapped storage, call
+`FlashDataPack::open(pointer, capacity)` on a 4-byte-aligned image. Keep the
+image and the `FlashDataPack` object alive until speech ends.
+
+## Find dialects and fit a smaller pack
+
+- `--list languages` and `--list voices` show language files and variants in
+  the eSpeak NG source. `--list presets` lists the preset combinations.
+- `--languages en,pt` includes available dialects. To choose specific ones,
+  use `--dialects en-US,pt-BR` with `--voices none` or your preferred
+  variant list.
+- `--compact` leaves out eSpeak NG's optional extra Russian, Mandarin and
+  Cantonese dictionary entries. Use it when you need those languages on a
+  board with less flash.
+
+Once the source and requested revision are cached, add `--offline` to build
+or list voices without fetching them again.

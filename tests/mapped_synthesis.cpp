@@ -132,18 +132,29 @@ int main()
     }
 
     std::vector<espeak::DataFile> entries(english.files, english.files + english.count);
-    alignas(4) static const uint8_t wrongVersion[8] = {};
-    for (auto &entry : entries) {
-        if (std::strcmp(entry.path, "phondata") == 0) {
-            entry.data = wrongVersion;
-            entry.size = sizeof(wrongVersion);
-        }
-    }
-
     const espeak::DataPack badPack{entries.data(), entries.size()};
     espeak::detail::useDataPack(&badPack);
     espeak_ng_InitializePath(espeak::kBuiltinDataPath);
+
+    alignas(4) uint8_t phondataHeader[8] = {};
+    for (auto &entry : entries) {
+        if (std::strcmp(entry.path, "phondata") == 0) {
+            entry.data = phondataHeader;
+            entry.size = sizeof(phondataHeader);
+        }
+    }
+
     assert(espeak_ng_Initialize(nullptr) == ENS_VERSION_MISMATCH);
+    assert(espeak_ng_Terminate() == ENS_OK);
+
+    size_t originalSize = 0;
+    espeak::detail::useDataPack(&english);
+    const void *original = pico_espeak_map_file("/pico-espeak/espeak-ng-data/phondata", &originalSize);
+    assert(original && originalSize >= sizeof(phondataHeader));
+    std::memcpy(phondataHeader, original, 4);
+    std::memset(phondataHeader + 4, 0xff, 4);
+    espeak::detail::useDataPack(&badPack);
+    assert(espeak_ng_Initialize(nullptr) == ENS_UNSUPPORTED_PHON_FORMAT);
     assert(espeak_ng_Terminate() == ENS_OK);
 
     espeak::detail::useDataPack(nullptr);

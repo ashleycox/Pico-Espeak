@@ -131,15 +131,19 @@ static espeak_ng_STATUS ReadPhFile(void **ptr, void **allocation, const char *fn
 	return ENS_OK;
 }
 
+static uint32_t ReadPhHeaderWord(const unsigned char *bytes)
+{
+	return (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8 |
+	       (uint32_t)bytes[2] << 16 | (uint32_t)bytes[3] << 24;
+}
+
 espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
 {
 	int ix;
-	int version;
 	int length = 0;
 	int phontab_size = 0;
 	int phondata_size = 0;
 	int phonindex_size = 0;
-	int rate;
 	unsigned char *p;
 	unsigned char *p_end;
 
@@ -152,25 +156,28 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
 		return status;
 	if ((status = ReadPhFile((void **)&tunes, &allocated_tunes, "intonations", &length, context)) != ENS_OK)
 		return status;
-	if ((phonindex_size < sizeof(*phoneme_index)) || (length < sizeof(TUNE)))
-		return ENS_UNSUPPORTED_PHON_FORMAT;
-	wavefile_data = (unsigned char *)phondata_ptr;
+	const size_t program_count = phonindex_size / sizeof(*phoneme_index);
+	if (program_count == 0 || phonindex_size % sizeof(*phoneme_index))
+		return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phonindex");
+	if (length < 4 * sizeof(TUNE) || length % sizeof(TUNE))
+		return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "intonations");
 	n_tunes = length / sizeof(TUNE);
-
-	// read the version number and sample rate from the first 8 bytes of phondata
-	version = 0; // bytes 0-3, version number
-	rate = 0;    // bytes 4-7, sample rate
-	if (wavefile_data && (phondata_size >= 8)) {
-		for (ix = 0; ix < 4; ix++) {
-			version += (wavefile_data[ix] << (ix*8));
-			rate += (wavefile_data[ix+4] << (ix*8));
-		}
+	for (ix = 0; ix < n_tunes; ++ix) {
+		if (memchr(tunes[ix].name, 0, sizeof(tunes[ix].name)) == NULL ||
+		    tunes[ix].n_head_extend > sizeof(tunes[ix].head_extend) || tunes[ix].split_tune >= n_tunes)
+			return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "intonations");
 	}
 
+	if (phondata_size < 8)
+		return create_file_error_context(context, ENS_UNEXPECTED_EOF, "phondata");
+	wavefile_data = (unsigned char *)phondata_ptr;
+	const uint32_t version = ReadPhHeaderWord(wavefile_data);
+	const uint32_t rate = ReadPhHeaderWord(wavefile_data + 4);
 	if (version != version_phdata)
-		return create_version_mismatch_error_context(context, path_home, version, version_phdata);
-	if (rate <= 0)
-		return ENS_UNSUPPORTED_PHON_FORMAT;
+		return create_version_mismatch_error_context(context, path_home, (int)version, version_phdata);
+	// WavegenInit multiplies the sample rate by 64 in an int.
+	if (rate == 0 || rate > INT_MAX / 64)
+		return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phondata");
 
 	// set up phoneme tables
 	if ((phoneme_tab_data == NULL) || (phontab_size < 4))
@@ -178,23 +185,29 @@ espeak_ng_STATUS LoadPhData(int *srate, espeak_ng_ERROR_CONTEXT *context)
 	p = phoneme_tab_data;
 	p_end = p + phontab_size;
 	n_phoneme_tables = p[0];
-	if (n_phoneme_tables > N_PHONEME_TABS)
-		return ENS_UNSUPPORTED_PHON_FORMAT;
+	if (n_phoneme_tables == 0 || n_phoneme_tables > N_PHONEME_TABS)
+		return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phontab");
 	p += 4;
 
 	for (ix = 0; ix < n_phoneme_tables; ix++) {
 		int n_phonemes;
 		if (p_end - p < 4 + N_PHONEME_TAB_NAME)
-			return ENS_UNSUPPORTED_PHON_FORMAT;
+			return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phontab");
 		n_phonemes = p[0];
-		if (p[1] > ix || (size_t)(p_end - p - 4 - N_PHONEME_TAB_NAME) < n_phonemes * sizeof(PHONEME_TAB))
-			return ENS_UNSUPPORTED_PHON_FORMAT;
-		phoneme_tab_list[ix].n_phonemes = p[0];
+		if (p[1] > ix || (size_t)(p_end - p - 4 - N_PHONEME_TAB_NAME) < n_phonemes * sizeof(PHONEME_TAB) ||
+		    memchr(p + 4, 0, N_PHONEME_TAB_NAME) == NULL)
+			return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phontab");
+		phoneme_tab_list[ix].n_phonemes = n_phonemes;
 		phoneme_tab_list[ix].includes = p[1];
 		p += 4;
 		memcpy(phoneme_tab_list[ix].name, p, N_PHONEME_TAB_NAME);
 		p += N_PHONEME_TAB_NAME;
-		phoneme_tab_list[ix].phoneme_tab_ptr = (PHONEME_TAB *)p;
+		PHONEME_TAB *table = (PHONEME_TAB *)p;
+		for (int index = 0; index < n_phonemes; ++index) {
+			if (table[index].program >= program_count)
+				return create_file_error_context(context, ENS_UNSUPPORTED_PHON_FORMAT, "phontab");
+		}
+		phoneme_tab_list[ix].phoneme_tab_ptr = table;
 		p += (n_phonemes * sizeof(PHONEME_TAB));
 	}
 
@@ -222,6 +235,8 @@ void FreePhData(void)
 	phondata_ptr = NULL;
 	tunes = NULL;
 	n_tunes = 0;
+	n_phoneme_tables = 0;
+	n_phoneme_tab = 0;
 	current_phoneme_table = -1;
 }
 
